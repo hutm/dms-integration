@@ -42,19 +42,37 @@ class MemoryGoogle:
         self.tasks = {item["id"]: copy.deepcopy(item) for item in tasks}
         self.created = 0
         self.updated = []
+        self.moves = []
         self.lost_create_reply = False
 
     def list_tasks(self):
         return copy.deepcopy(list(self.tasks.values()))
 
-    def create(self, fields, reference):
+    def create(self, fields):
         self.created += 1
-        item = task("new-" + str(self.created), fields["text"], notes=reference, status="completed" if fields["completed"] else "needsAction")
+        item = task("new-" + str(self.created), fields["text"], status="completed" if fields["completed"] else "needsAction")
         self.tasks[item["id"]] = copy.deepcopy(item)
         if self.lost_create_reply:
             self.lost_create_reply = False
             raise sync.SyncError("Response lost after successful POST")
         return item
+
+    def move(self, item, parent_id):
+        target = self.tasks[item["id"]]
+        if parent_id:
+            target["parent"] = parent_id
+        else:
+            target.pop("parent", None)
+        sync.validate_tree({key: value.get("parent") for key, value in self.tasks.items()})
+        self.moves.append((item["id"], parent_id))
+        return copy.deepcopy(target)
+
+    def remove_marker(self, item, reference):
+        target = self.tasks[item["id"]]
+        if "notes" in target:
+            target["notes"] = "".join(line for line in target["notes"].splitlines(keepends=True)
+                                      if line.rstrip("\r\n") != reference)
+        return copy.deepcopy(target)
 
     def update(self, item, fields):
         target = self.tasks[item["id"]]
@@ -111,9 +129,23 @@ class SyncTests(unittest.TestCase):
         local, google = self.mapped(row("local", "Desktop edit"), task("remote", "Phone edit"))
         result = self.run_sync(local, google)
         self.assertEqual(result["conflicts_preserved"], 1)
-        self.assertEqual({item["text"] for item in local.rows}, {"Desktop edit", "Phone edit (Google conflict copy)"})
+        self.assertEqual({item["text"] for item in local.rows}, {"Desktop edit", "Phone edit"})
+        self.assertTrue(self.state["conflicts"])
         self.run_sync(local, google)
         self.assertEqual(google.created, 1)
+
+    def test_title_conflict_survives_local_cas_failure_after_remote_update(self):
+        local, google = self.mapped(row("local", "Desktop edit"), task("remote", "Phone edit"))
+        local.race = True
+        with self.assertRaises(sync.RetrySync):
+            self.run_sync(local, google)
+        self.assertEqual(google.tasks["remote"]["title"], "Desktop edit")
+        self.state = copy.deepcopy(self.saved)
+        self.assertTrue(self.state["pending_conflict_copies"])
+        local.race = False
+        self.run_sync(local, google)
+        self.assertEqual({item["text"] for item in local.rows}, {"Desktop edit", "Phone edit"})
+        self.assertFalse(self.state["pending_conflict_copies"])
 
     def test_local_delete_propagates(self):
         local, google = self.mapped(row("local", deletedAt="yesterday"))
@@ -137,14 +169,59 @@ class SyncTests(unittest.TestCase):
         self.run_sync(local, google)
         self.assertEqual(google.tasks[self.state["entries"]["local"]["remote_id"]]["title"], "Desktop edit")
 
-    def test_lost_create_reply_recovers_marker_without_duplicate(self):
+    def test_lost_create_reply_requires_explicit_review_without_duplicate(self):
         local, google = MemoryTodos([row("local")]), MemoryGoogle()
         google.lost_create_reply = True
         with self.assertRaises(sync.SyncError):
             self.run_sync(local, google)
         self.state = copy.deepcopy(self.saved)
+        with self.assertRaises(sync.SyncError):
+            self.run_sync(local, google)
+        self.assertEqual(google.created, 1)
+        report = sync.pending_report(google, self.state)
+        self.assertEqual(report[0]["candidate_remote_ids"], ["new-1"])
+        sync.resolve_creation(google, self.state, self.checkpoint, "local", "new-1")
         self.run_sync(local, google)
         self.assertEqual(google.created, 1)
+        self.assertNotIn("notes", google.tasks["new-1"])
+
+    def test_confirming_no_creation_allows_retry(self):
+        local, google = MemoryTodos([row("local")]), MemoryGoogle()
+        self.state["pending_creations"] = {"local": {
+            "fields": sync.local_fields(local.rows[0]), "before_ids": [],
+            "previous_remote_id": None, "started_at": sync.now(),
+        }}
+        sync.resolve_creation(google, self.state, self.checkpoint, "local")
+        self.run_sync(local, google)
+        self.assertEqual(google.created, 1)
+
+    def test_rejected_create_clears_intent_without_needing_manual_review(self):
+        local, google = MemoryTodos([row("local")]), MemoryGoogle()
+        google.create = Mock(side_effect=sync.RequestRejected("HTTP 400"))
+        with self.assertRaises(sync.RequestRejected):
+            self.run_sync(local, google)
+        self.assertFalse(self.state["pending_creations"])
+
+    def test_pending_creation_cannot_bind_an_unrelated_or_existing_task(self):
+        google = MemoryGoogle([task("existing"), task("other", "Different")])
+        self.state["pending_creations"] = {"local": {
+            "fields": {"text": "Task", "completed": False},
+            "before_ids": ["existing"], "started_at": sync.now(),
+        }}
+        for remote_id in ("existing", "other", "missing"):
+            with self.assertRaises(sync.SyncError):
+                sync.resolve_creation(google, self.state, self.checkpoint, "local", remote_id)
+        self.assertIn("local", self.state["pending_creations"])
+
+    def test_durable_mapping_clears_stale_creation_intent(self):
+        local, google = self.mapped()
+        self.state["pending_creations"] = {"local": {
+            "previous_remote_id": None, "fields": sync.local_fields(local.rows[0]),
+            "before_ids": [], "started_at": sync.now(),
+        }}
+        self.run_sync(local, google)
+        self.assertFalse(self.state["pending_creations"])
+        self.assertEqual(google.created, 0)
 
     def test_lost_compare_and_swap_keeps_baseline_for_retry(self):
         local, google = self.mapped(remote_task=task("remote", "Phone edit"))
@@ -183,6 +260,180 @@ class SyncTests(unittest.TestCase):
         parent_index = next(index for index, item in enumerate(local.rows) if item["text"] == "Parent")
         self.assertEqual(local.rows[parent_index + 1]["text"], "Child")
         self.assertEqual(local.rows[parent_index + 1]["parentId"], local.rows[parent_index]["id"])
+
+    def test_local_hierarchy_exports_even_when_child_precedes_parent(self):
+        local = MemoryTodos([row("child", "Child", parentId="parent"), row("parent", "Parent")])
+        google = MemoryGoogle()
+        self.run_sync(local, google)
+        entries = self.state["entries"]
+        self.assertEqual(google.tasks[entries["child"]["remote_id"]]["parent"], entries["parent"]["remote_id"])
+        self.assertEqual([item["id"] for item in local.rows], ["parent", "child"])
+        self.run_sync(local, google)
+        self.assertEqual(len(google.moves), 1)
+
+    def grouped(self):
+        local = MemoryTodos([row("a", "A"), row("b", "B"), row("child", "Child", parentId="a")])
+        google = MemoryGoogle()
+        self.run_sync(local, google)
+        return local, google
+
+    def test_reparenting_and_promotion_propagate_from_dms(self):
+        local, google = self.grouped()
+        child = next(item for item in local.rows if item["id"] == "child")
+        remote_id = self.state["entries"]["child"]["remote_id"]
+        for parent in ("b", None, "a"):
+            child["parentId"] = parent
+            self.run_sync(local, google)
+            expected = self.state["entries"][parent]["remote_id"] if parent else None
+            self.assertEqual(google.tasks[remote_id].get("parent"), expected)
+            child = next(item for item in local.rows if item["id"] == "child")
+
+    def test_reparenting_and_promotion_propagate_from_google(self):
+        local, google = self.grouped()
+        remote_id = self.state["entries"]["child"]["remote_id"]
+        for parent in ("b", None, "a"):
+            expected = self.state["entries"][parent]["remote_id"] if parent else None
+            google.move(google.tasks[remote_id], expected)
+            self.run_sync(local, google)
+            self.assertEqual(next(item for item in local.rows if item["id"] == "child")["parentId"], parent)
+
+    def test_simultaneous_parent_moves_keep_desktop_choice_and_private_conflict(self):
+        local, google = self.grouped()
+        child = self.state["entries"]["child"]["remote_id"]
+        next(item for item in local.rows if item["id"] == "child")["parentId"] = "b"
+        google.move(google.tasks[child], None)
+        result = self.run_sync(local, google)
+        self.assertEqual(result["conflicts_preserved"], 1)
+        self.assertEqual(google.tasks[child]["parent"], self.state["entries"]["b"]["remote_id"])
+        self.assertEqual(self.state["conflicts"]["child:parent"]["remote_parent"], None)
+
+    def test_remote_parent_move_merges_with_local_title_edit(self):
+        local, google = self.grouped()
+        child = self.state["entries"]["child"]["remote_id"]
+        next(item for item in local.rows if item["id"] == "child")["text"] = "Desktop title"
+        google.move(google.tasks[child], self.state["entries"]["b"]["remote_id"])
+        self.run_sync(local, google)
+        changed = next(item for item in local.rows if item["id"] == "child")
+        self.assertEqual((changed["text"], changed["parentId"]), ("Desktop title", "b"))
+
+    def test_local_parent_move_resurrects_remotely_deleted_task(self):
+        local, google = self.grouped()
+        child = self.state["entries"]["child"]["remote_id"]
+        google.tasks[child]["deleted"] = True
+        next(item for item in local.rows if item["id"] == "child")["parentId"] = "b"
+        self.run_sync(local, google)
+        replacement = self.state["entries"]["child"]["remote_id"]
+        self.assertNotEqual(child, replacement)
+        self.assertEqual(google.tasks[replacement]["parent"], self.state["entries"]["b"]["remote_id"])
+
+    def test_legacy_flat_exports_are_nested_without_recreating(self):
+        local, google = self.grouped()
+        for entry in self.state["entries"].values():
+            entry.pop("parent_base", None)
+        remote_id = self.state["entries"]["child"]["remote_id"]
+        google.tasks[remote_id].pop("parent")
+        self.run_sync(local, google)
+        self.assertEqual(google.created, 3)
+        self.assertEqual(google.tasks[remote_id]["parent"], self.state["entries"]["a"]["remote_id"])
+
+    def test_local_parent_child_inversion_detaches_before_attaching(self):
+        local, google = self.grouped()
+        next(item for item in local.rows if item["id"] == "a")["parentId"] = "child"
+        next(item for item in local.rows if item["id"] == "child")["parentId"] = None
+        self.run_sync(local, google)
+        a = self.state["entries"]["a"]["remote_id"]
+        child = self.state["entries"]["child"]["remote_id"]
+        self.assertEqual(google.tasks[a]["parent"], child)
+        self.assertIsNone(google.tasks[child].get("parent"))
+
+    def test_parent_delete_does_not_cascade_to_a_child_moved_out(self):
+        local, google = self.grouped()
+        next(item for item in local.rows if item["id"] == "a")["deletedAt"] = "today"
+        next(item for item in local.rows if item["id"] == "child")["parentId"] = "b"
+        self.run_sync(local, google)
+        self.assertTrue(google.tasks[self.state["entries"]["a"]["remote_id"]]["deleted"])
+        self.assertFalse(google.tasks[self.state["entries"]["child"]["remote_id"]].get("deleted"))
+
+    def test_remote_parent_move_is_not_lost_to_a_local_delete(self):
+        local, google = self.grouped()
+        child = next(item for item in local.rows if item["id"] == "child")
+        child["deletedAt"] = "today"
+        remote_id = self.state["entries"]["child"]["remote_id"]
+        google.move(google.tasks[remote_id], self.state["entries"]["b"]["remote_id"])
+        self.run_sync(local, google)
+        child = next(item for item in local.rows if item["id"] == "child")
+        self.assertNotIn("deletedAt", child)
+        self.assertEqual(child["parentId"], "b")
+
+    def test_nested_grandchildren_export_and_import(self):
+        local = MemoryTodos([row("root"), row("child", parentId="root"), row("grandchild", parentId="child")])
+        google = MemoryGoogle()
+        self.run_sync(local, google)
+        child = self.state["entries"]["child"]["remote_id"]
+        grandchild = self.state["entries"]["grandchild"]["remote_id"]
+        self.assertEqual(google.tasks[grandchild]["parent"], child)
+
+    def test_local_cycle_aborts_before_google_writes(self):
+        local = MemoryTodos([row("a", parentId="b"), row("b", parentId="a")])
+        google = MemoryGoogle()
+        with self.assertRaises(sync.SyncError):
+            self.run_sync(local, google)
+        self.assertEqual(google.created, 0)
+
+    def test_hierarchy_compare_and_swap_race_keeps_parent_baseline(self):
+        local, google = self.grouped()
+        child = self.state["entries"]["child"]["remote_id"]
+        google.move(google.tasks[child], self.state["entries"]["b"]["remote_id"])
+        local.race = True
+        with self.assertRaises(sync.RetrySync):
+            self.run_sync(local, google)
+        self.assertEqual(self.state["entries"]["child"]["parent_base"], "a")
+        local.race = False
+        self.run_sync(local, google)
+        self.assertEqual(next(item for item in local.rows if item["id"] == "child")["parentId"], "b")
+
+    def test_legacy_marker_cleanup_preserves_user_notes(self):
+        reference = sync.marker("test", "local")
+        local, google = self.mapped(remote_task=task("remote", notes="Keep my notes\n"+reference+"\nMore notes"))
+        self.run_sync(local, google)
+        self.assertEqual(google.tasks["remote"]["notes"], "Keep my notes\nMore notes")
+
+    def test_legacy_unmapped_creation_recovers_then_removes_marker(self):
+        local = MemoryTodos([row("local")])
+        google = MemoryGoogle([task("remote", notes=sync.marker("test", "local"))])
+        self.run_sync(local, google)
+        self.assertEqual(google.created, 0)
+        self.assertEqual(google.tasks["remote"]["notes"], "")
+
+    def test_legacy_conflict_suffix_is_removed_from_both_sides(self):
+        identifier = "conflict-"+"a"*24
+        title = "Retained title (Google conflict copy)"
+        local = MemoryTodos([row(identifier, title)])
+        google = MemoryGoogle([task("remote", title)])
+        self.state["entries"][identifier] = {"remote_id": "remote", "base": {"text": title, "completed": False}}
+        self.run_sync(local, google)
+        self.assertEqual(local.rows[0]["text"], "Retained title")
+        self.assertEqual(google.tasks["remote"]["title"], "Retained title")
+
+    def test_user_authored_conflict_suffix_is_not_removed(self):
+        title = "My title (Google conflict copy)"
+        local, google = self.mapped(row("local", title), task("remote", title))
+        self.state["entries"]["local"]["base"]["text"] = title
+        self.run_sync(local, google)
+        self.assertEqual(local.rows[0]["text"], title)
+
+    def test_hidden_completed_task_move_is_deferred(self):
+        local, google = self.grouped()
+        child = self.state["entries"]["child"]["remote_id"]
+        google.tasks[child]["hidden"] = True
+        google.tasks[child]["status"] = "completed"
+        next(item for item in local.rows if item["id"] == "child")["parentId"] = "b"
+        result = self.run_sync(local, google)
+        self.assertEqual(result["hierarchy_deferred"], 1)
+        self.assertEqual(self.state["entries"]["child"]["parent_base"], "a")
+        google.tasks[child].pop("hidden")
+        self.run_sync(local, google)
+        self.assertEqual(google.tasks[child]["parent"], self.state["entries"]["b"]["remote_id"])
 
     def test_parent_deletion_does_not_destroy_concurrent_child_edit(self):
         local, google = self.mapped(row("local", deletedAt="yesterday"))
@@ -240,6 +491,48 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(call.kwargs["json"], {"title": "New"})
         self.assertEqual(call.kwargs["headers"], {"If-Match": "remote-1"})
         self.assertIn("list%2Fid", call.args[1])
+
+    def test_create_does_not_annotate_notes(self):
+        api = self.api()
+        api.session.request.return_value = Mock(status_code=200, content=b"json", json=lambda: task("new"))
+        api.create({"text": "Task", "completed": False})
+        self.assertEqual(api.session.request.call_args.kwargs["json"], {"title": "Task", "status": "needsAction"})
+
+    def test_move_uses_parent_query_and_conditional_request(self):
+        api = self.api()
+        api.session.request.side_effect = [
+            Mock(status_code=200, content=b"json", json=lambda: task("remote", etag="fresh")),
+            Mock(status_code=200, content=b"json", json=lambda: task("remote", parent="parent")),
+            Mock(status_code=200, content=b"json", json=lambda: task("remote")),
+            Mock(status_code=200, content=b"json", json=lambda: task("remote")),
+        ]
+        api.move(task("remote"), "parent")
+        call = api.session.request.call_args
+        self.assertEqual(call.args[0], "POST")
+        self.assertTrue(call.args[1].endswith("/remote/move"))
+        self.assertEqual(call.kwargs["params"], {"parent": "parent"})
+        self.assertEqual(call.kwargs["headers"], {"If-Match": "fresh"})
+        api.move(task("remote"), None)
+        self.assertEqual(api.session.request.call_args.kwargs["params"], {})
+
+    def test_move_does_not_overwrite_an_intervening_parent_edit(self):
+        api = self.api()
+        api.session.request.return_value = Mock(status_code=200, content=b"json", json=lambda: task("remote", parent="another-parent"))
+        with self.assertRaises(sync.RetrySync):
+            api.move(task("remote"), "parent")
+        self.assertEqual(api.session.request.call_count, 1)
+
+    def test_marker_cleanup_is_exact_and_preserves_unrelated_notes(self):
+        api = self.api()
+        api.session.request.return_value = Mock(status_code=200, content=b"json", json=lambda: task("remote"))
+        reference = sync.marker("test", "local")
+        api.remove_marker(task("remote", notes="My note\n"+reference+"\nOther note"), reference)
+        call = api.session.request.call_args
+        self.assertEqual(call.kwargs["json"], {"notes": "My note\nOther note"})
+        self.assertEqual(call.kwargs["headers"], {"If-Match": "remote-1"})
+        api.session.request.reset_mock()
+        api.remove_marker(task("remote", notes="My note mentions "+reference), reference)
+        api.session.request.assert_not_called()
 
     def test_server_edit_aborts_without_retrying_mutation(self):
         api = self.api()

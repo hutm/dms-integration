@@ -8,14 +8,14 @@ The sync runs locally as your desktop user. GitHub Pages hosts informational doc
 
 ## Behavior
 
-- Synchronizes task titles, completion/reopening, and intentional deletions in both directions.
+- Synchronizes task titles, completion/reopening, intentional deletions, and parent/subtask relationships in both directions, including reparenting and promotion to the top level.
 - Polls every 30 seconds while the graphical session runs; it does not receive Google push notifications.
-- Merges independent field edits. Concurrent title edits retain a Google conflict copy.
+- Merges independent field edits. Concurrent title edits keep both versions as ordinary tasks, with conflict details stored privately. Concurrent parent moves prefer the desktop choice and record both choices privately.
 - Uses Google ETags and DMS compare-and-swap IPC to detect concurrent changes.
-- Uses stable task markers to recover interrupted task creation without duplicating it.
+- Keeps identifiers and recovery metadata in private local state, without adding technical labels to task titles or notes.
 - Backs up local task snapshots before applying changes.
 
-Due dates, user notes, and ordering are not actively synchronized. A marker is added to the notes of tasks created by this integration. New desktop tasks are exported without Google nesting; local nesting is retained, and Google nesting is imported when a task is first downloaded. Existing tasks on both sides are combined on first sync, not matched by title. Intentional deletions propagate, so keep backups of important tasks.
+Due dates, user notes, and sibling ordering are not actively synchronized. Existing exact sync-marker lines and generated conflict-copy suffixes are removed automatically while preserving other user text. Existing flat exports acquire their DMS parent relationships without recreating the tasks. Google does not allow hidden completed tasks to be reparented; such moves are deferred until Google permits them. Existing tasks on both sides are combined on first sync, not matched by title. Intentional deletions propagate, so keep backups of important tasks.
 
 ## NixOS installation
 
@@ -80,6 +80,23 @@ journalctl --user -u dank-todo-google-sync.service -n 20
 ```
 
 User state defaults to `~/.local/state/dank-todo-google-tasks/`. Credentials, settings, mappings, and local snapshots are private files. Do not delete mappings to repair routine errors: doing so can create duplicates. The status command reports connection-file presence and last sync metadata, not a live Google authentication check.
+
+### Interrupted task creation
+
+Google Tasks has no private application metadata or client-assigned IDs. Without visible note markers, a lost creation response cannot be safely retried automatically. The client checkpoints intent before each creation and pauses sync if its outcome is unknown. Ordinary successful creations require no intervention; definitive HTTP rejections clear the intent for retry.
+
+```bash
+dank-todo-google-sync pending
+# After reviewing the matching task in Google Tasks:
+dank-todo-google-sync resolve-create --local-id LOCAL_ID --remote-id GOOGLE_ID
+# Or, only after confirming that no task was created:
+dank-todo-google-sync resolve-create --local-id LOCAL_ID --not-created
+dank-todo-google-sync sync
+```
+
+The pending command reports identifiers and candidate identifiers, without printing task text. It never guesses based on titles alone. Only bind a task after checking it in Google Tasks.
+
+The first run migrates synchronization state to version 2 and saves a private version-1 backup. Older clients refuse this state format. Rollbacks require care to avoid restoring stale task mappings; keep the upgraded client installed with its state.
 
 To disconnect:
 
