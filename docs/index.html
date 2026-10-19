@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="dms-integration is a personal desktop bridge between Dank Todo and Google Tasks.">
+  <title>dms-integration — Personal task sync</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main>
+    <p class="eyebrow">Personal desktop integration</p>
+    <h1>dms-integration</h1>
+    <p class="intro">Keep a personal Dank Todo list in sync with Google Tasks.</p>
+    <p>This integration runs on the owner's Linux desktop as part of Dank Material Shell (DMS). It synchronizes task titles, completion status, and deletions between the Dank Todo widget and one selected Google Tasks list.</p>
+    <h2>How it works</h2>
+    <p>The owner signs in directly with Google and grants the Google Tasks permission. The desktop periodically connects to the Google Tasks API using that authorization. Google Tasks access is needed to read, create, update, and delete tasks as part of two-way synchronization.</p>
+    <p>This is a personal tool, not a hosted task service. This website only describes the integration; it does not accept Google sign-ins or collect task contents. Installing the desktop integration and obtaining authorization are separate from visiting this site.</p>
+    <h2>Data and control</h2>
+    <p>Task data and authorization files are kept in the owner's desktop account, and synchronized tasks are stored in the owner's Google account. The owner can stop synchronization or revoke Google's authorization at any time. See the privacy policy for storage, backups, and removal details.</p>
+    <p>Maintained by Maksim Khadkevich. For technical questions, use the <a href="https://github.com/hutm/dms-integration/issues">project issue tracker</a>. Do not post private tasks or credentials.</p>
+    <nav aria-label="Policies">
+      <a href="privacy.html">Privacy policy</a>
+      <a href="terms.html">Terms of use</a>
+    </nav>
+  </main>
+</body>
+</html>

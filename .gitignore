@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+result
+result-*
+.playwright-mcp/
+.env
+.env.*
+client.json
+client_secret*
+token.json
+settings.json
+state.json
+backups/

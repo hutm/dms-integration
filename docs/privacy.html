@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Privacy policy — dms-integration</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main>
+    <p class="eyebrow">dms-integration</p>
+    <h1>Privacy policy</h1>
+    <p>Effective October 19, 2026. This policy describes the personal desktop integration maintained by Maksim Khadkevich.</p>
+    <h2>Google data accessed</h2>
+    <p>The integration requests <code>https://www.googleapis.com/auth/tasks</code> to select a task list and read, create, update, and delete its tasks. The API returns task-list and task records, including titles, completion state, identifiers, timestamps, notes, and other available task metadata. Synchronization uses task titles, completion state, deletion state, and identifiers. It adds a synchronization marker to the notes of tasks it creates. It does not request Gmail, Google Drive, contacts, or calendar access.</p>
+    <h2>Purpose and sharing</h2>
+    <p>Google data is used only to synchronize the owner's Dank Todo widget with the selected Google Tasks list and preserve synchronization state. The desktop communicates with Google's OAuth and Tasks services over HTTPS. The integration has no hosted application backend and does not sell task data, use it for advertising, or use it to train AI models.</p>
+    <p>The use of information received from Google APIs adheres to the <a href="https://developers.google.com/terms/api-services-user-data-policy">Google API Services User Data Policy</a>, including its Limited Use requirements.</p>
+    <h2>Storage and retention</h2>
+    <p>Tasks are stored by Dank Todo in the owner's desktop account and by Google Tasks in the owner's Google account. OAuth credentials and synchronization metadata are stored in private files in the owner's desktop account. Local synchronization backups may contain task data. The owner may also back up local files using separately configured backup tools; those copies follow the owner's backup retention settings.</p>
+    <p>Credentials and task contents are not published on this website or in its public repository. Local data remains until the owner removes it, and Google account data remains subject to Google's controls and retention practices.</p>
+    <h2>Stopping access and deleting data</h2>
+    <p>The owner can stop the desktop synchronization timer and revoke access through <a href="https://myaccount.google.com/connections">Google Account connections</a>. Revoking access prevents subsequent authorized API access; it does not delete existing tasks or local copies. To remove stored data, the owner must also delete the local integration credentials, synchronization state, Dank Todo data, any backups, and any unwanted Google Tasks separately. Two-way sync propagates intentional task deletions while it is enabled.</p>
+    <h2>This informational website</h2>
+    <p>This website has no analytics scripts, advertising, sign-in form, or task database. GitHub Pages hosts it and may collect technical request data, such as visitors' IP addresses, under the <a href="https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement">GitHub Privacy Statement</a>.</p>
+    <h2>Contact and changes</h2>
+    <p>Questions can be raised in the <a href="https://github.com/hutm/dms-integration/issues">project issue tracker</a>. Do not include task contents, tokens, or other private information. This page will be updated if the integration's data practices change.</p>
+    <nav aria-label="Policies"><a href="index.html">Home</a><a href="terms.html">Terms of use</a></nav>
+  </main>
+</body>
+</html>
