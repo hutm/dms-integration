@@ -8,18 +8,33 @@ The sync runs locally as your desktop user. GitHub Pages hosts informational doc
 
 ## Behavior
 
-- Synchronizes task titles, completion/reopening, intentional deletions, and parent/subtask relationships in both directions, including reparenting and promotion to the top level.
+- Synchronizes task titles, calendar dates, multiline notes, completion/reopening, intentional deletions, and parent/subtask relationships in both directions, including reparenting and promotion to the top level.
 - Polls every 30 seconds while the graphical session runs; it does not receive Google push notifications.
-- Merges independent field edits. Concurrent title edits keep both versions as ordinary tasks, with conflict details stored privately. Concurrent parent moves prefer the desktop choice and record both choices privately.
+- Merges independent field edits. Conflicting edits to the same title, date or notes keep both versions as ordinary tasks, with conflict details stored privately. Concurrent parent moves prefer the desktop choice and record both choices privately.
 - Uses Google ETags and DMS compare-and-swap IPC to detect concurrent changes.
+- Recovers a missing widget IPC after DMS startup without reloading an available widget during normal polls.
 - Keeps identifiers and recovery metadata in private local state, without adding technical labels to task titles or notes.
-- Backs up local task snapshots before applying changes.
+- Shares one task model across display widgets so another monitor cannot overwrite newly added tasks with stale data.
+- Backs up changed local task snapshots before network access, including offline runs, and before applying sync changes.
 
-Due dates, user notes, and sibling ordering are not actively synchronized. Existing exact sync-marker lines and generated conflict-copy suffixes are removed automatically while preserving other user text. Existing flat exports acquire their DMS parent relationships without recreating the tasks. Google does not allow hidden completed tasks to be reparented; such moves are deferred until Google permits them. Existing tasks on both sides are combined on first sync, not matched by title. Intentional deletions propagate, so keep backups of important tasks.
+Dates have no time component or reminders; sibling ordering is not actively synchronized. Existing exact sync-marker lines and generated conflict-copy suffixes are removed automatically while preserving other user text. Existing flat exports acquire their DMS parent relationships without recreating the tasks. Google does not allow hidden completed tasks to be reparented; such moves are deferred until Google permits them. Existing tasks on both sides are combined on first sync, not matched by title. Intentional deletions propagate, so keep backups of important tasks.
+
+## Dates and notes
+
+Click a task’s pencil to edit its title, date, and multiline notes. Choose a date
+from Calendar or enter YYYY-MM-DD. Clear removes the date. Save changes applies
+the edit; Escape cancels. Dates and a Notes indicator appear under task titles.
+Notes allow up to 8192 characters. Existing Google dates and notes are imported
+on upgrade; missing fields in old local task files do not erase Google metadata.
+An open editor preserves incoming changes to untouched fields and blocks an
+overwrite if the same field has changed differently elsewhere.
+
+The fork is maintained as ordinary source files under `plugin/`, with its pinned
+upstream base and MIT license recorded there. See `plugin/UPSTREAM.md`.
 
 ## NixOS installation
 
-Requires NixOS/nixpkgs with `programs.dms-shell.plugins` support, a running DMS desktop session, and Home Manager integrated as a NixOS module. The module installs and patches Dank Todo v1.2.0 declaratively; no `dms plugins install` step is needed.
+Requires NixOS/nixpkgs with `programs.dms-shell.plugins` support, a running DMS desktop session, and Home Manager integrated as a NixOS module. The module installs the maintained Dank Todo v1.3.0 fork under `plugin/` declaratively; no `dms plugins install` step is needed.
 
 Add this flake input:
 
@@ -39,7 +54,7 @@ services.dankTodoGoogleTasks = {
 };
 ```
 
-Keep your existing DMS configuration enabled. Rebuild and reload DMS so the patched plugin loads. The activation helper enables the widget, and archives any CLI-installed copy that would override the declarative plugin. The sync service runs as your desktop user without sudo. Credentials must stay outside the Nix store.
+Keep your existing DMS configuration enabled. Rebuild and reload DMS so the maintained plugin loads. The activation helper enables the widget, and archives any CLI-installed copy that would override the declarative plugin. The sync service runs as your desktop user without sudo. Credentials must stay outside the Nix store.
 
 For Niri, add this binding to your existing configuration:
 
@@ -47,7 +62,7 @@ For Niri, add this binding to your existing configuration:
 Super+Shift+F12 { spawn "dms" "ipc" "call" "widget" "toggle" "dankTodo"; }
 ```
 
-The package alone can also be built with `nix build` or run with `nix run . -- status`. It still requires the patched, running DMS plugin. On non-Nix systems, apply `dank-todo-sync.patch` to the pinned Dank Todo version and run `python google-tasks-sync.py` in an environment installed from `requirements.txt`.
+The package alone can also be built with `nix build` or run with `nix run . -- status`. It still requires the maintained, running DMS plugin. On non-Nix systems, install the `plugin/` directory as your Dank Todo plugin and run `python google-tasks-sync.py` in an environment installed from `requirements.txt`.
 
 ## Google authorization
 
@@ -96,7 +111,7 @@ dank-todo-google-sync sync
 
 The pending command reports identifiers and candidate identifiers, without printing task text. It never guesses based on titles alone. Only bind a task after checking it in Google Tasks.
 
-The first run migrates synchronization state to version 2 and saves a private version-1 backup. Older clients refuse this state format. Rollbacks require care to avoid restoring stale task mappings; keep the upgraded client installed with its state.
+The first run migrates synchronization state to version 3 and saves a private backup of the previous version. Older clients refuse this state format. Rollbacks require care to avoid restoring stale task mappings; keep the upgraded client installed with its state.
 
 To disconnect:
 
@@ -115,4 +130,4 @@ nix flake check
 
 The offline suite covers creation, edits, deletion conflicts, interrupted operations, nesting, private file permissions, pagination, and conditional updates. It does not contact Google or read personal tasks. Live two-way synchronization was also checked on the original desktop deployment with temporary tasks.
 
-The QML patch targets upstream commit `ff1b82c3061fce3c32c8f65792fa81b928ab35d1` (Dank Todo v1.2.0). Upstream DMS and Dank Todo retain their respective licenses. This repository distributes integration code and a patch rather than a copy of the plugin.
+The maintained plugin fork is based on upstream commit `ff1b82c3061fce3c32c8f65792fa81b928ab35d1` (Dank Todo v1.2.0). Its original MIT license is retained in `plugin/LICENSE`; provenance and maintenance notes are in `plugin/UPSTREAM.md`. DMS retains its own license.

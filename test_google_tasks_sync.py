@@ -6,7 +6,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 spec = importlib.util.spec_from_file_location("google_tasks_sync", Path(__file__).with_name("google-tasks-sync.py"))
 sync = importlib.util.module_from_spec(spec)
@@ -51,6 +51,10 @@ class MemoryGoogle:
     def create(self, fields):
         self.created += 1
         item = task("new-" + str(self.created), fields["text"], status="completed" if fields["completed"] else "needsAction")
+        if fields.get("notes"):
+            item["notes"] = fields["notes"]
+        if fields.get("dueDate"):
+            item["due"] = fields["dueDate"] + "T00:00:00.000Z"
         self.tasks[item["id"]] = copy.deepcopy(item)
         if self.lost_create_reply:
             self.lost_create_reply = False
@@ -78,6 +82,13 @@ class MemoryGoogle:
         target = self.tasks[item["id"]]
         target["title"] = fields["text"]
         target["status"] = "completed" if fields["completed"] else "needsAction"
+        if "notes" in fields and fields["notes"] != target.get("notes", ""):
+            target["notes"] = fields["notes"]
+        if "dueDate" in fields and fields["dueDate"] != (target.get("due") or "")[:10]:
+            if fields["dueDate"]:
+                target["due"] = fields["dueDate"] + "T00:00:00.000Z"
+            else:
+                target.pop("due", None)
         self.updated.append(item["id"])
         return copy.deepcopy(target)
 
@@ -108,6 +119,23 @@ class SyncTests(unittest.TestCase):
         self.state["entries"]["local"] = {"remote_id": "remote", "base": {"text": "Task", "completed": False}}
         return local, google
 
+    def test_local_snapshot_saved_before_network_failure(self):
+        local = MemoryTodos([row("parent"), row("child", parentId="parent")])
+        google = MemoryGoogle()
+        google.list_tasks = Mock(side_effect=sync.SyncError("Offline"))
+        with self.assertRaises(sync.SyncError):
+            self.run_sync(local, google)
+        backup = next((self.directory / "backups").glob("*-local.json"))
+        self.assertEqual(json.loads(backup.read_text())["todos"], local.rows)
+
+    def test_unchanged_local_snapshot_does_not_repeat_backups(self):
+        local, google = self.mapped()
+        self.run_sync(local, google)
+        self.run_sync(local, google)
+        count = len(list((self.directory / "backups").glob("*-local.json")))
+        self.run_sync(local, google)
+        self.assertEqual(len(list((self.directory / "backups").glob("*-local.json"))), count)
+
     def test_first_sync_exports_and_imports_without_duplicate_tasks(self):
         local = MemoryTodos([row("local", "Desktop"), row("deleted", deletedAt="yesterday")])
         google = MemoryGoogle([task("remote", "Phone")])
@@ -124,6 +152,81 @@ class SyncTests(unittest.TestCase):
         self.assertTrue(local.rows[0]["completed"])
         self.assertEqual(google.tasks["remote"]["notes"], "Keep these notes")
         self.assertEqual(google.tasks["remote"]["due"], "2026-10-20T00:00:00Z")
+
+    def test_upgrade_imports_existing_remote_metadata(self):
+        local, google = self.mapped(remote_task=task("remote", notes="Existing notes\nSecond line", due="2026-10-21T00:00:00Z"))
+        self.run_sync(local, google)
+        self.assertEqual(local.rows[0]["notes"], "Existing notes\nSecond line")
+        self.assertEqual(local.rows[0]["dueDate"], "2026-10-21")
+
+    def test_new_local_task_exports_date_and_multiline_notes(self):
+        local = MemoryTodos([row("local", dueDate="2026-11-01", notes="First line\nSecond line")])
+        google = MemoryGoogle()
+        self.run_sync(local, google)
+        self.assertEqual(google.tasks["new-1"]["due"], "2026-11-01T00:00:00.000Z")
+        self.assertEqual(google.tasks["new-1"]["notes"], "First line\nSecond line")
+
+    def test_independent_date_and_note_changes_merge(self):
+        local, google = self.mapped(row("local", dueDate="2026-10-22"), task("remote", notes="Phone notes"))
+        self.run_sync(local, google)
+        self.assertEqual(local.rows[0]["notes"], "Phone notes")
+        self.assertEqual(google.tasks["remote"]["due"][:10], "2026-10-22")
+
+    def test_clear_metadata_in_both_directions(self):
+        local, google = self.mapped(row("local", dueDate="2026-10-22", notes="Notes"), task("remote", due="2026-10-22T00:00:00Z", notes="Notes"))
+        self.run_sync(local, google)
+        local.rows[0]["dueDate"] = ""
+        local.rows[0]["notes"] = ""
+        self.run_sync(local, google)
+        self.assertNotIn("due", google.tasks["remote"])
+        self.assertEqual(google.tasks["remote"]["notes"], "")
+        local.rows[0].update(dueDate="2026-10-23", notes="More notes")
+        self.run_sync(local, google)
+        google.tasks["remote"].pop("due")
+        google.tasks["remote"]["notes"] = ""
+        self.run_sync(local, google)
+        self.assertEqual(local.rows[0]["dueDate"], "")
+        self.assertEqual(local.rows[0]["notes"], "")
+
+    def test_concurrent_note_edits_preserve_both_versions(self):
+        local, google = self.mapped()
+        self.run_sync(local, google)
+        local.rows[0]["notes"] = "Desktop notes"
+        google.tasks["remote"]["notes"] = "Phone notes"
+        self.run_sync(local, google)
+        self.assertEqual({r["notes"] for r in local.rows}, {"Desktop notes", "Phone notes"})
+        self.assertTrue(all(r["text"] == "Task" for r in local.rows))
+
+    def test_concurrent_dates_survive_local_apply_conflict(self):
+        local, google = self.mapped()
+        self.run_sync(local, google)
+        local.rows[0]["dueDate"] = "2026-10-24"
+        google.tasks["remote"]["due"] = "2026-10-25T00:00:00Z"
+        local.race = True
+        with self.assertRaises(sync.RetrySync):
+            self.run_sync(local, google)
+        self.state = copy.deepcopy(self.saved)
+        local.race = False
+        self.run_sync(local, google)
+        self.assertEqual({r["dueDate"] for r in local.rows}, {"2026-10-24", "2026-10-25"})
+
+    def test_remote_deletion_preserves_a_concurrent_note_edit(self):
+        local, google = self.mapped()
+        self.run_sync(local, google)
+        local.rows[0]["notes"] = "New local note"
+        google.tasks["remote"]["deleted"] = True
+        self.run_sync(local, google)
+        self.assertFalse(local.rows[0].get("deletedAt"))
+        self.assertEqual(google.tasks["new-1"]["notes"], "New local note")
+
+    def test_invalid_dates_and_long_notes_abort_before_remote_mutation(self):
+        for details in [{"dueDate": "2026-02-30"}, {"dueDate": "20261020"}, {"notes": "x" * 8193}]:
+            with self.subTest(details=list(details)):
+                local = MemoryTodos([row("local", **details)])
+                google = MemoryGoogle()
+                with self.assertRaises(sync.SyncError):
+                    self.run_sync(local, google)
+                self.assertEqual(google.created, 0)
 
     def test_same_field_conflict_preserves_both_titles(self):
         local, google = self.mapped(row("local", "Desktop edit"), task("remote", "Phone edit"))
@@ -497,6 +600,48 @@ class ApiTests(unittest.TestCase):
         api.session.request.return_value = Mock(status_code=200, content=b"json", json=lambda: task("new"))
         api.create({"text": "Task", "completed": False})
         self.assertEqual(api.session.request.call_args.kwargs["json"], {"title": "Task", "status": "needsAction"})
+
+    def test_create_writes_date_and_user_notes(self):
+        api = self.api()
+        api.session.request.return_value = Mock(status_code=200, content=b"json", json=lambda: task("new"))
+        api.create({"text": "Task", "completed": False, "dueDate": "2026-11-02", "notes": "A\nB"})
+        body = api.session.request.call_args.kwargs["json"]
+        self.assertEqual(body["due"], "2026-11-02T00:00:00.000Z")
+        self.assertEqual(body["notes"], "A\nB")
+
+    def test_patch_clears_date_and_notes_explicitly(self):
+        api = self.api()
+        api.session.request.return_value = Mock(status_code=200, content=b"json", json=lambda: task("remote"))
+        api.update(task("remote", due="2026-11-02T00:00:00Z", notes="Old"),
+                   {"text": "Task", "completed": False, "dueDate": "", "notes": ""})
+        self.assertEqual(api.session.request.call_args.kwargs["json"], {"due": None, "notes": ""})
+
+    def test_unchanged_metadata_is_not_sent(self):
+        api = self.api()
+        api.update(task("remote", due="2026-11-02T00:00:00Z", notes="Same"),
+                   {"text": "Task", "completed": False, "dueDate": "2026-11-02", "notes": "Same"})
+        api.session.request.assert_not_called()
+
+    def test_old_plugin_schema_is_rejected_before_sync(self):
+        local = sync.DmsTodos()
+        local.ipc = Mock(return_value=json.dumps({"todos": [], "token": "old", "storageFilePath": "/old"}))
+        with self.assertRaises(sync.SyncError):
+            local.snapshot()
+
+    def test_missing_widget_ipc_refreshes_plugin_then_retries(self):
+        with patch.object(sync.subprocess, "run", side_effect=[
+                Mock(stdout="Target not found.\n", returncode=0),
+                Mock(stdout="RESCAN_TRIGGERED: dankTodo", returncode=0)]) as run:
+            with self.assertRaises(sync.RetrySync):
+                sync.DmsTodos().snapshot()
+            self.assertEqual(run.call_args.args[0],
+                             ["dms", "ipc", "call", "plugin-scan", "rescan", "dankTodo"])
+
+    def test_ready_widget_does_not_reload_on_normal_polls(self):
+        payload = {"schemaVersion": 3, "todos": [], "token": "current", "storageFilePath": "/todos"}
+        with patch.object(sync.subprocess, "run", return_value=Mock(stdout=json.dumps(payload), returncode=0)) as run:
+            self.assertEqual(sync.DmsTodos().snapshot(), payload)
+            self.assertEqual(run.call_count, 1)
 
     def test_move_uses_parent_query_and_conditional_request(self):
         api = self.api()

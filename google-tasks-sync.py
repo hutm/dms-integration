@@ -12,7 +12,7 @@ import sys
 import tempfile
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
@@ -58,11 +58,25 @@ def read_json(path, default=None):
 
 
 def local_fields(row):
-    return {"text": row["text"], "completed": bool(row.get("completed"))}
+    due = row.get("dueDate") or ""
+    if due:
+        try:
+            if date.fromisoformat(due).isoformat() != due:
+                raise ValueError()
+        except (ValueError, TypeError) as error:
+            raise SyncError("A task date must be a valid YYYY-MM-DD date") from error
+    notes = row.get("notes") or ""
+    if not isinstance(notes, str) or len(notes) > 8192:
+        raise SyncError("Task notes must contain at most 8192 characters")
+    return {"text": row["text"], "completed": bool(row.get("completed")),
+            "dueDate": due, "notes": notes}
 
 
 def remote_fields(task):
-    return {"text": task.get("title", ""), "completed": task.get("status") == "completed"}
+    return local_fields({"text": task.get("title", ""),
+                         "completed": task.get("status") == "completed",
+                         "dueDate": (task.get("due") or "")[:10],
+                         "notes": task.get("notes", "")})
 
 
 def stable_id(prefix, value):
@@ -106,7 +120,7 @@ class GoogleTasks:
 
     def request(self, method, path, *, body=None, params=None, etag=None):
         # Never automatically retry mutations: a lost POST response may still
-        # have created a task. The next run recovers it using its sync marker.
+        # have created a task. Durable creation intents require reconciliation.
         response = self.session.request(
             method, API_URL + path, json=body, params=params,
             headers={"If-Match": etag} if etag else {}, timeout=25,
@@ -148,10 +162,15 @@ class GoogleTasks:
         return self.pages(self.path(), maxResults=100, showCompleted="true", showHidden="true", showDeleted="true")
 
     def create(self, fields):
-        return self.request("POST", self.path(), body={
+        body = {
             "title": fields["text"],
             "status": "completed" if fields["completed"] else "needsAction",
-        })
+        }
+        if fields.get("notes"):
+            body["notes"] = fields["notes"]
+        if fields.get("dueDate"):
+            body["due"] = fields["dueDate"] + "T00:00:00.000Z"
+        return self.request("POST", self.path(), body=body)
 
     def move(self, task, parent_id):
         # Creating/moving siblings can invalidate other ETags. Refresh without
@@ -182,6 +201,10 @@ class GoogleTasks:
             body["status"] = "completed" if fields["completed"] else "needsAction"
             if not fields["completed"]:
                 body["completed"] = None
+        if "notes" in fields and fields["notes"] != task.get("notes", ""):
+            body["notes"] = fields["notes"]
+        if "dueDate" in fields and fields["dueDate"] != (task.get("due") or "")[:10]:
+            body["due"] = fields["dueDate"] + "T00:00:00.000Z" if fields["dueDate"] else None
         return self.request("PATCH", self.path(task["id"]), body=body, etag=task.get("etag")) if body else task
 
     def delete(self, task):
@@ -195,17 +218,29 @@ class DmsTodos:
             ["dms", "ipc", "call", "dankTodo", method, *args],
             capture_output=True, text=True, timeout=15,
         )
+        if result.stdout.strip() == "Target not found.":
+            # DMS can discover its system plugin before the user override,
+            # unload the system widget, then leave a stale "loaded" flag.
+            # Rescan only when IPC is absent; never interrupt an open editor
+            # during normal polls. This also repairs startup after a crash.
+            subprocess.run(
+                ["dms", "ipc", "call", "plugin-scan", "rescan", "dankTodo"],
+                capture_output=True, text=True, timeout=15, check=True,
+            )
+            raise RetrySync("Dank Todo was unavailable; refreshed its plugin and will retry")
         if result.returncode:
-            raise SyncError("Dank Todo sync IPC unavailable; enable the patched Nix plugin in DMS")
+            raise SyncError("Dank Todo sync IPC unavailable; enable the Nix-managed Dank Todo plugin in DMS")
         return result.stdout.strip()
 
     def snapshot(self):
         try:
             snapshot = json.loads(self.ipc("syncSnapshot"))
         except json.JSONDecodeError as error:
-            raise SyncError("Dank Todo needs the Nix sync patch; reload its plugin") from error
+            raise SyncError("Dank Todo sync IPC returned invalid data; reload its plugin") from error
         if "error" in snapshot:
             raise RetrySync("Dank Todo is still loading")
+        if snapshot.get("schemaVersion", 0) < 3:
+            raise SyncError("Reload the updated Dank Todo plugin before syncing dates and notes")
         return snapshot
 
     def apply(self, snapshot, rows, state_dir):
@@ -268,7 +303,7 @@ def pending_report(api, state):
         "candidate_remote_ids": [task["id"] for task in tasks
                                  if task["id"] not in pending["before_ids"]
                                  and not task.get("deleted")
-                                 and remote_fields(task) == pending["fields"]],
+                                 and remote_fields(task) == local_fields(pending["fields"])],
     } for local_id, pending in state.get("pending_creations", {}).items()]
 
 
@@ -281,7 +316,7 @@ def resolve_creation(api, state, checkpoint, local_id, remote_id=None):
                 entry["remote_id"] == remote_id for entry in state.get("entries", {}).values()):
             raise SyncError("That Google task already existed or is mapped to another task")
         task = next((task for task in api.list_tasks() if task["id"] == remote_id), None)
-        if not task or task.get("deleted") or remote_fields(task) != pending["fields"]:
+        if not task or task.get("deleted") or remote_fields(task) != local_fields(pending["fields"]):
             raise SyncError("The selected Google task does not match the pending creation")
         entry = state.setdefault("entries", {}).setdefault(local_id, {"base": pending["fields"]})
         entry["remote_id"] = remote_id
@@ -296,6 +331,13 @@ def sync(api, local, state, checkpoint, state_dir):
     storage = snapshot["storageFilePath"]
     if state.get("storage") not in (None, storage):
         raise SyncError("Dank Todo storage location changed; restore it before syncing")
+    # Capture local additions even when no Google changes need applying or the
+    # network fails. Previously backups only covered sync writes to the widget.
+    latest_snapshot = state_dir / "last-local-snapshot.json"
+    if read_json(latest_snapshot, {}).get("todos") != snapshot["todos"]:
+        atomic_json(state_dir / "backups" / (str(time.time_ns()) + "-local.json"),
+                    {"version": 2, "todos": snapshot["todos"]})
+        atomic_json(latest_snapshot, snapshot)
     state["storage"] = storage
     entries = state.setdefault("entries", {})
     rows = copy.deepcopy(snapshot["todos"])
@@ -307,6 +349,8 @@ def sync(api, local, state, checkpoint, state_dir):
             row = copy.deepcopy(saved)
             rows.append(row)
             by_id[identifier] = row
+    for row in rows:
+        row.update(local_fields(row))
     validate_tree({row["id"]: row.get("parentId") for row in rows})
     check_pending(state, checkpoint)
     tasks = {task["id"]: task for task in api.list_tasks()}
@@ -353,7 +397,9 @@ def sync(api, local, state, checkpoint, state_dir):
         row = by_id.get(local_id)
         task = tasks.get(entry["remote_id"])
         remote_deleted = task is None or task.get("deleted", False)
-        base = entry["base"]
+        # Old versions did not synchronize dates or notes. Empty defaults mean
+        # existing Google metadata is imported rather than erased on upgrade.
+        base = local_fields(entry["base"])
         if row is None:
             # Missing records are never interpreted as a request to delete.
             # Dank Todo expresses intentional deletions with deletedAt.
@@ -393,7 +439,7 @@ def sync(api, local, state, checkpoint, state_dir):
             remote = remote_fields(task)
             merged = {}
             collision = False
-            for field in ("text", "completed"):
+            for field in ("text", "completed", "dueDate", "notes"):
                 local_changed = current[field] != base[field]
                 remote_changed = remote[field] != base[field]
                 collision |= local_changed and remote_changed and current[field] != remote[field]
@@ -407,7 +453,7 @@ def sync(api, local, state, checkpoint, state_dir):
                     conflict["parentId"] = reverse.get(task.get("parent"))
                     rows.append(conflict)
                     by_id[conflict_id] = conflict
-                    private_conflict(state, conflict_id, "text", source=local_id)
+                    private_conflict(state, conflict_id, "fields", source=local_id)
                     # Preserve Google's alternative before overwriting it.
                     # A failed local CAS must not lose that version on retry.
                     state.setdefault("pending_conflict_copies", {})[conflict_id] = copy.deepcopy(conflict)
@@ -604,10 +650,10 @@ def main():
     auth.add_argument("--no-browser", action="store_true", help="Print the URL for manual opening on this computer")
     subparsers.add_parser(
         "sync", help="Perform one two-way synchronization",
-        description="Synchronize titles, completion and deletions with the selected Google list. "
+        description="Synchronize titles, dates, notes, completion and deletions with the selected Google list. "
         "Synchronize parent/subtask relationships in both directions. Concurrent text edits "
-        "retain both versions without adding labels. Due dates, user notes and sibling "
-        "ordering are left unchanged. Legacy sync markers are removed from Google notes.",
+        "retain both versions without adding labels. Dates are calendar dates without times. "
+        "Sibling ordering is left unchanged. Legacy sync markers are removed from Google notes.",
     )
     subparsers.add_parser("status", help="Show connection and last-sync status without task contents")
     subparsers.add_parser("pending", help="Show identifiers for interrupted task creations needing review")
@@ -640,14 +686,15 @@ def main():
         settings = read_json(directory / "settings.json", {})
         if not settings.get("list_id"):
             raise SyncError("Missing list settings; run auth again")
-        if state.get("version", 1) not in (1, 2):
+        if state.get("version", 1) not in (1, 2, 3):
             raise SyncError("Unsupported sync state version")
         if state.get("list_id", settings["list_id"]) != settings["list_id"]:
             raise SyncError("Google list changed; refusing to reuse another list's task mapping")
-        if state.get("version", 1) == 1:
-            atomic_json(directory / "backups" / (str(time.time_ns()) + "-state-v1.json"), state)
-        # Old clients must not ignore unresolved, marker-free creation intents.
-        state["version"] = 2
+        if state.get("version", 1) != 3:
+            atomic_json(directory / "backups" / (str(time.time_ns()) +
+                        "-state-v" + str(state.get("version", 1)) + ".json"), state)
+        # Old clients would discard date/note fields when applying local data.
+        state["version"] = 3
         state.setdefault("instance", uuid.uuid4().hex)
         state["list_id"] = settings["list_id"]
         checkpoint = lambda data: atomic_json(directory / "state.json", data)

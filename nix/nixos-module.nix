@@ -15,16 +15,7 @@ in {
   config = lib.mkIf cfg.enable {
     programs.dms-shell.plugins.dankTodo = {
       enable = true;
-      src = pkgs.applyPatches {
-        name = "dank-todo-google-tasks";
-        src = pkgs.fetchFromGitHub {
-          owner = "deepu105";
-          repo = "dms-dank-todo";
-          rev = "ff1b82c3061fce3c32c8f65792fa81b928ab35d1"; # v1.2.0
-          hash = "sha256-zX9rtJwq5KyXHG55bQXbV7osAMHTkL9l7qSRqEgh6kI=";
-        };
-        patches = [ ../dank-todo-sync.patch ];
-      };
+      src = ../plugin;
     };
 
     home-manager.users.${cfg.user} = { lib, ... }: {

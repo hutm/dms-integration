@@ -18,11 +18,14 @@
         let pkgs = import nixpkgs { inherit system; };
         in {
           regression = pkgs.runCommand "dms-integration-regression" {
-            nativeBuildInputs = [ pkgs.python3 ];
+            nativeBuildInputs = [ pkgs.python3 pkgs.nodejs ];
           } ''
             cp ${./google-tasks-sync.py} google-tasks-sync.py
             cp ${./test_google_tasks_sync.py} test_google_tasks_sync.py
+            cp -r ${./plugin} plugin
+            cp ${./test_todo_shared.js} test_todo_shared.js
             python -B -m unittest discover -v
+            node test_todo_shared.js
             touch "$out"
           '';
         });
