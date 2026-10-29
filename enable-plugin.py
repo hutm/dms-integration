@@ -54,20 +54,30 @@ def add_widget(settings):
     settings["barConfigs"] = bars
 
 
-def main():
-    home = Path.home()
-    config = Path(os.environ.get("XDG_CONFIG_HOME", home / ".config")) / "DankMaterialShell"
-    # A CLI-installed copy takes precedence over the NixOS plugin. Archive it
-    # once the system copy is available so future rebuilds control the version.
+def link_system_plugin(config, state, system=Path("/etc/xdg/quickshell/dms-plugins/dankTodo")):
+    # DMS 1.6.2 forgets the plugin when an overriding user manifest disappears,
+    # even if its system manifest remains installed. Keep a stable discovery
+    # link to NixOS's plugin instead of removing the user manifest on rebuild.
     local = config / "plugins/dankTodo"
-    system = Path("/etc/xdg/quickshell/dms-plugins/dankTodo/plugin.json")
-    if system.exists() and (local.exists() or local.is_symlink()):
-        state = Path(os.environ.get("XDG_STATE_HOME", home / ".local/state"))
+    if not (system / "plugin.json").is_file():
+        return
+    if local.is_symlink() and os.readlink(local) == str(system):
+        return
+    if local.exists() or local.is_symlink():
         backup = state / "dms-plugin-backups"
         backup.mkdir(parents=True, exist_ok=True)
         destination = Path(tempfile.mkdtemp(prefix="dankTodo-", dir=backup)) / "plugin"
         shutil.move(str(local), destination)
         print(f"Archived CLI-installed Dank Todo to {destination}")
+    local.parent.mkdir(parents=True, exist_ok=True)
+    local.symlink_to(system)
+
+
+def main():
+    home = Path.home()
+    config = Path(os.environ.get("XDG_CONFIG_HOME", home / ".config")) / "DankMaterialShell"
+    state = Path(os.environ.get("XDG_STATE_HOME", home / ".local/state"))
+    link_system_plugin(config, state)
 
     update_json(config / "settings.json", add_widget)
     update_json(config / "plugin_settings.json", lambda settings: settings.setdefault("dankTodo", {}).update(enabled=True))

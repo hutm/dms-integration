@@ -52,7 +52,7 @@ upstream base and MIT license recorded there. See `plugin/UPSTREAM.md`.
 
 ## NixOS installation
 
-Requires NixOS/nixpkgs with `programs.dms-shell.plugins` support, a running DMS desktop session, and Home Manager integrated as a NixOS module. The module installs the maintained Dank Todo v1.4.0 fork under `plugin/` declaratively; no `dms plugins install` step is needed.
+Requires NixOS/nixpkgs with `programs.dms-shell.plugins` support, a running DMS desktop session, and Home Manager integrated as a NixOS module. The module installs the maintained Dank Todo v1.4.0 fork under `plugin/` declaratively; no `dms plugins install` step is needed. Activation keeps a stable user-directory discovery link to the NixOS-managed plugin; this avoids DMS 1.6.2 forgetting the plugin when an old user override is removed during a rebuild.
 
 Add this flake input:
 
