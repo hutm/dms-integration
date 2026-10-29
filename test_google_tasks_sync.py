@@ -638,7 +638,7 @@ class ApiTests(unittest.TestCase):
                              ["dms", "ipc", "call", "plugin-scan", "rescan", "dankTodo"])
 
     def test_ready_widget_does_not_reload_on_normal_polls(self):
-        payload = {"schemaVersion": 3, "todos": [], "token": "current", "storageFilePath": "/todos"}
+        payload = {"schemaVersion": 4, "lists": [], "todos": [], "token": "current", "storageFilePath": "/todos"}
         with patch.object(sync.subprocess, "run", return_value=Mock(stdout=json.dumps(payload), returncode=0)) as run:
             self.assertEqual(sync.DmsTodos().snapshot(), payload)
             self.assertEqual(run.call_count, 1)
@@ -692,6 +692,220 @@ class ApiTests(unittest.TestCase):
         with self.assertRaises(sync.SyncError) as error:
             api.list_tasks()
         self.assertNotIn("private-token", str(error.exception))
+
+
+class MemoryDocument:
+    def __init__(self, rows=(), lists=None):
+        self.document = {"lists": lists or [{"id": "default", "title": "Dank Todo"}],
+                         "todos": [{"listId": "default", **copy.deepcopy(item)} for item in rows]}
+        self.race = False
+
+    def snapshot(self):
+        return {"schemaVersion": 4, "token": json.dumps(self.document, sort_keys=True),
+                "storageFilePath": "/todos.json", **copy.deepcopy(self.document)}
+
+    def apply_document(self, snapshot, document, directory):
+        if self.race or snapshot["token"] != self.snapshot()["token"]:
+            raise sync.RetrySync("Concurrent local edit")
+        sync.validate_document(document)
+        self.document = copy.deepcopy(document)
+
+
+class MemoryLists:
+    def __init__(self):
+        self.providers = {"original": MemoryGoogle()}
+        self.names = {"original": "Dank Todo"}
+        self.list_id = None
+        self.lost_reply = False
+        self.created = 0
+
+    def list_lists(self):
+        return [{"id": key, "title": title} for key, title in self.names.items()]
+
+    def create_list(self, title):
+        self.created += 1
+        key = "new-list-" + str(self.created)
+        self.names[key] = title
+        self.providers[key] = MemoryGoogle()
+        if self.lost_reply:
+            self.lost_reply = False
+            raise sync.SyncError("Lost response after successful list creation")
+        return {"id": key, "title": title}
+
+    def __getattr__(self, key):
+        return getattr(self.providers[self.list_id], key)
+
+
+class MultipleListsTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        self.state = {"version": 3, "instance": "keep-instance", "list_id": "original", "entries": {}}
+        self.saved = copy.deepcopy(self.state)
+        self.settings = {"list_id": "original"}
+        self.local = MemoryDocument([row("desktop")])
+        self.google = MemoryLists()
+
+    def checkpoint(self, state):
+        self.saved = copy.deepcopy(state)
+
+    def run_sync(self):
+        return sync.sync_lists(self.google, self.local, self.state, self.settings, self.checkpoint, self.directory)
+
+    def second(self, title="Personal"):
+        self.google.names["second"] = title
+        self.google.providers["second"] = MemoryGoogle([task("phone", "Phone", notes="Notes", due="2026-11-01T00:00:00Z")])
+
+    def test_migration_keeps_original_mapping_instance_and_metadata(self):
+        self.state["entries"]["desktop"] = {"remote_id": "existing", "base": sync.local_fields(row("desktop"))}
+        self.google.providers["original"] = MemoryGoogle([task("existing")])
+        self.run_sync()
+        original = self.state["list_states"]["default"]
+        self.assertEqual(self.state["version"], 4)
+        self.assertEqual(original["instance"], "keep-instance")
+        self.assertEqual(original["entries"]["desktop"]["remote_id"], "existing")
+        self.assertEqual(self.google.providers["original"].created, 0)
+        self.assertEqual(len(list((self.directory / "backups").glob("*-before-multiple-lists.json"))), 1)
+
+    def test_discover_all_lists_and_sync_them_without_cross_export(self):
+        self.second()
+        result = self.run_sync()
+        self.assertEqual(result["lists"], 2)
+        self.assertEqual(result["tasks"], 2)
+        self.assertEqual(self.google.providers["second"].created, 0)
+        phone = next(item for item in self.local.document["todos"] if item["text"] == "Phone")
+        self.assertNotEqual(phone["listId"], "default")
+        self.assertEqual(phone["notes"], "Notes")
+        self.assertEqual(phone["dueDate"], "2026-11-01")
+        self.run_sync()
+        self.assertEqual(len(self.local.document["todos"]), 2)
+        self.assertEqual(len(self.google.providers["original"].tasks), 1)
+
+    def test_new_dms_list_created_once_and_tasks_go_to_that_list(self):
+        self.local.document["lists"].append({"id": "work", "title": "Work"})
+        self.local.document["todos"].append(row("work-item", "Work task", listId="work"))
+        self.run_sync()
+        self.run_sync()
+        self.assertEqual(self.google.created, 1)
+        self.assertEqual(self.google.providers["new-list-1"].created, 1)
+        self.assertEqual(self.google.providers["original"].created, 1)
+
+    def test_remote_rename_changes_tab_without_changing_ids(self):
+        self.second()
+        self.run_sync()
+        before = copy.deepcopy(self.local.document["todos"])
+        self.google.names["second"] = "Renamed"
+        self.run_sync()
+        self.assertEqual(self.local.document["todos"], before)
+        self.assertIn("Renamed", [item["title"] for item in self.local.document["lists"]])
+
+    def test_deleted_google_list_preserves_local_tasks_and_can_return(self):
+        self.second()
+        self.run_sync()
+        before = copy.deepcopy(self.local.document["todos"])
+        del self.google.names["second"]
+        self.assertEqual(self.run_sync()["unavailable_lists"], 1)
+        self.assertEqual(self.local.document["todos"], before)
+        self.assertTrue(any(item.get("available") is False for item in self.local.document["lists"]))
+        self.assertEqual(self.google.created, 0)
+        self.google.names["second"] = "Personal"
+        self.assertEqual(self.run_sync()["unavailable_lists"], 0)
+        self.assertFalse(any(item.get("available") is False for item in self.local.document["lists"]))
+
+    def test_same_task_id_and_same_list_names_are_kept_separate(self):
+        self.second("Dank Todo")
+        self.google.providers["original"] = MemoryGoogle([task("phone", "Other phone")])
+        self.run_sync()
+        self.assertEqual(len(self.local.document["lists"]), 2)
+        self.assertEqual(len({item["id"] for item in self.local.document["todos"]}), 3)
+
+    def test_metadata_cas_failure_does_not_leave_mapping_to_missing_local_list(self):
+        self.second()
+        self.local.race = True
+        with self.assertRaises(sync.RetrySync):
+            self.run_sync()
+        self.state = copy.deepcopy(self.saved)
+        self.assertEqual(set(self.state["list_states"]), {"default"})
+        self.local.race = False
+        self.run_sync()
+        self.assertEqual(len(self.local.document["lists"]), 2)
+
+    def test_scoped_cas_preserves_edit_in_other_list(self):
+        self.second()
+        self.run_sync()
+        scoped = sync.ListTodos(self.local, "default")
+        snapshot = scoped.snapshot()
+        phone = next(item for item in self.local.document["todos"] if item["listId"] != "default")
+        phone["notes"] = "Concurrent draft"
+        with self.assertRaises(sync.RetrySync):
+            scoped.apply(snapshot, snapshot["todos"], self.directory)
+        self.assertEqual(phone["notes"], "Concurrent draft")
+
+    def test_cross_list_parent_rejected_before_network(self):
+        self.local.document["lists"].append({"id": "work", "title": "Work"})
+        self.local.document["todos"].append(row("child", listId="work", parentId="desktop"))
+        self.google.list_lists = Mock()
+        with self.assertRaises(sync.SyncError):
+            self.run_sync()
+        self.google.list_lists.assert_not_called()
+
+    def test_lost_list_creation_response_requires_review_and_recovers_without_duplicate(self):
+        self.local.document["lists"].append({"id": "work", "title": "Work"})
+        self.google.lost_reply = True
+        with self.assertRaises(sync.SyncError):
+            self.run_sync()
+        with self.assertRaises(sync.SyncError):
+            self.run_sync()
+        report = sync.pending_lists_report(self.google, self.state)
+        self.assertEqual(report[0]["candidate_remote_ids"], ["new-list-1"])
+        sync.resolve_list(self.google, self.state, self.checkpoint, "work", "new-list-1")
+        self.run_sync()
+        self.assertEqual(self.google.created, 1)
+        self.assertEqual(len(self.local.document["lists"]), 2)
+
+    def test_confirming_list_not_created_allows_one_new_attempt(self):
+        self.state = {"version": 4, "list_states": {}, "pending_lists": {"work": {
+            "title": "Work", "before_ids": ["original"], "started_at": "then"}}}
+        sync.resolve_list(self.google, self.state, self.checkpoint, "work")
+        self.assertEqual(self.state["pending_lists"], {})
+
+    def test_bad_storage_path_is_rejected_before_network(self):
+        self.state["storage"] = "/different.json"
+        self.google.list_lists = Mock()
+        with self.assertRaises(sync.SyncError):
+            self.run_sync()
+        self.google.list_lists.assert_not_called()
+
+    def test_changed_membership_is_rejected_before_network(self):
+        self.second()
+        self.run_sync()
+        phone = next(item for item in self.local.document["todos"] if item["text"] == "Phone")
+        phone["listId"] = "default"
+        self.google.list_lists = Mock()
+        with self.assertRaises(sync.SyncError):
+            self.run_sync()
+        self.google.list_lists.assert_not_called()
+
+    def test_inactive_list_changes_sync_both_directions(self):
+        self.second()
+        self.run_sync()
+        phone = next(item for item in self.local.document["todos"] if item["text"] == "Phone")
+        phone["notes"] = "Desktop edit in another tab"
+        self.google.providers["second"].tasks["phone"]["due"] = "2026-12-02T00:00:00Z"
+        self.run_sync()
+        phone = next(item for item in self.local.document["todos"] if item["text"] == "Phone")
+        self.assertEqual(phone["dueDate"], "2026-12-02")
+        self.assertEqual(self.google.providers["second"].tasks["phone"]["notes"], "Desktop edit in another tab")
+
+    def test_pending_task_does_not_prevent_other_lists_syncing(self):
+        self.second()
+        self.run_sync()
+        self.state["list_states"]["default"]["pending_creations"] = {"unknown": {"previous_remote_id": None}}
+        self.google.providers["second"].tasks["phone"]["title"] = "Changed upstream"
+        with self.assertRaises(sync.SyncError):
+            self.run_sync()
+        self.assertIn("Changed upstream", [item["text"] for item in self.local.document["todos"]])
 
 
 if __name__ == "__main__":

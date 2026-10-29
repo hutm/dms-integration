@@ -154,6 +154,12 @@ class GoogleTasks:
         self.list_id = selected["id"]
         return self.list_id
 
+    def list_lists(self):
+        return self.pages("users/@me/lists", maxResults=100)
+
+    def create_list(self, title):
+        return self.request("POST", "users/@me/lists", body={"title": title})
+
     def path(self, task_id=None):
         result = "lists/" + quote(self.list_id, safe="") + "/tasks"
         return result + "/" + quote(task_id, safe="") if task_id else result
@@ -239,8 +245,8 @@ class DmsTodos:
             raise SyncError("Dank Todo sync IPC returned invalid data; reload its plugin") from error
         if "error" in snapshot:
             raise RetrySync("Dank Todo is still loading")
-        if snapshot.get("schemaVersion", 0) < 3:
-            raise SyncError("Reload the updated Dank Todo plugin before syncing dates and notes")
+        if snapshot.get("schemaVersion") != 4:
+            raise SyncError("Reload the updated Dank Todo plugin before syncing multiple lists")
         return snapshot
 
     def apply(self, snapshot, rows, state_dir):
@@ -253,6 +259,203 @@ class DmsTodos:
             raise RetrySync("Local tasks changed during sync; retrying on the next run")
         if result != "OK":
             raise SyncError("Dank Todo could not apply the synchronized tasks: " + result)
+
+    def apply_document(self, snapshot, document, state_dir):
+        self.apply(snapshot, document, state_dir)
+
+
+def validate_document(snapshot):
+    lists = snapshot.get("lists", [])
+    identifiers = [item.get("id") for item in lists]
+    if (not lists or any(not isinstance(key, str) or not key for key in identifiers)
+            or len(set(identifiers)) != len(identifiers)):
+        raise SyncError("Invalid or duplicate task list identifiers")
+    for item in lists:
+        if not isinstance(item.get("title"), str) or not item["title"].strip() or len(item["title"]) > 1024:
+            raise SyncError("Invalid task list name")
+    rows = snapshot["todos"]
+    by_id = {row["id"]: row for row in rows}
+    if len(by_id) != len(rows):
+        raise SyncError("Duplicate local task identifiers")
+    for row in rows:
+        if row.get("listId") not in identifiers:
+            raise SyncError("Task belongs to an unknown list")
+        parent = by_id.get(row.get("parentId"))
+        if row.get("parentId") and (not parent or parent["listId"] != row["listId"]):
+            raise SyncError("A subtask must belong to the same list as its parent")
+        local_fields(row)
+    validate_tree({row["id"]: row.get("parentId") for row in rows})
+
+
+class ListTodos:
+    """Scope the proven task merge to one list, retaining a whole-document CAS."""
+
+    def __init__(self, local, list_id):
+        self.local = local
+        self.list_id = list_id
+
+    def snapshot(self):
+        document = self.local.snapshot()
+        validate_document(document)
+        return {**document, "_document": document,
+                "todos": [row for row in document["todos"] if row["listId"] == self.list_id]}
+
+    def apply(self, snapshot, rows, state_dir):
+        document = snapshot["_document"]
+        merged = [row for row in document["todos"] if row["listId"] != self.list_id]
+        merged.extend({**row, "listId": self.list_id} for row in rows)
+        self.local.apply_document(document, {"lists": document["lists"], "todos": merged}, state_dir)
+
+
+def migrate_lists(state, settings, directory, checkpoint):
+    if state.get("version", 1) not in (1, 2, 3, 4):
+        raise SyncError("Unsupported sync state version")
+    if state.get("version") == 4:
+        return
+    if state.get("list_id", settings["list_id"]) != settings["list_id"]:
+        raise SyncError("Google list changed; refusing to reuse another list's task mapping")
+    atomic_json(directory / "backups" / (str(time.time_ns()) + "-before-multiple-lists.json"), state)
+    original = copy.deepcopy(state)
+    original["list_id"] = settings["list_id"]
+    original.setdefault("instance", uuid.uuid4().hex)
+    state.clear()
+    state.update(version=4, list_states={"default": original}, pending_lists={})
+    checkpoint(state)
+
+
+def create_mapped_list(api, state, checkpoint, local_id, title, remote):
+    pending = state.setdefault("pending_lists", {})
+    if local_id in pending:
+        raise SyncError("A Google list creation needs review; run dank-todo-google-sync pending")
+    pending[local_id] = {"title": title, "before_ids": list(remote), "started_at": now()}
+    checkpoint(state)
+    try:
+        created = api.create_list(title)
+    except (RequestRejected, RetrySync):
+        del pending[local_id]
+        checkpoint(state)
+        raise
+    state["list_states"][local_id] = {"list_id": created["id"], "instance": uuid.uuid4().hex,
+                                        "title": created["title"], "entries": {}}
+    checkpoint(state)
+    del pending[local_id]
+    checkpoint(state)
+    return created
+
+
+def sync_lists(api, local, state, settings, checkpoint, directory):
+    snapshot = local.snapshot()
+    validate_document(snapshot)
+    # Back up the entire document (including unsynchronized lists) before HTTP.
+    latest = directory / "last-local-document.json"
+    previous = read_json(latest, {})
+    if any(previous.get(key) != snapshot[key] for key in ("lists", "todos")):
+        atomic_json(directory / "backups" / (str(time.time_ns()) + "-document.json"), snapshot)
+        atomic_json(latest, snapshot)
+    migrate_lists(state, settings, directory, checkpoint)
+    states = state["list_states"]
+    if len({item["list_id"] for item in states.values()}) != len(states):
+        raise SyncError("Two local lists are mapped to the same Google list")
+    if any(item.get("storage") not in (None, snapshot["storageFilePath"]) for item in states.values()):
+        raise SyncError("Dank Todo storage location changed; restore it before syncing")
+    by_id = {row["id"]: row for row in snapshot["todos"]}
+    mapped_ids = set()
+    for key, item in states.items():
+        for identifier in item.get("entries", {}):
+            if identifier in mapped_ids:
+                raise SyncError("A task is mapped to more than one list")
+            mapped_ids.add(identifier)
+            if identifier in by_id and by_id[identifier]["listId"] != key:
+                raise SyncError("A mapped task changed lists unexpectedly; restore its list before syncing")
+    local_lists = {item["id"]: copy.deepcopy(item) for item in snapshot["lists"]}
+    if any(key not in local_lists for key in states):
+        raise SyncError("A mapped local list is missing; restore it before syncing")
+    remote = {item["id"]: item for item in api.list_lists()}
+    # A response lost after POST is never retried blindly. Mapping written before
+    # cleanup, however, conclusively proves that the original POST succeeded.
+    for key in list(state.setdefault("pending_lists", {})):
+        if key in states:
+            del state["pending_lists"][key]
+            checkpoint(state)
+    if state["pending_lists"]:
+        raise SyncError("A Google list creation needs review; run dank-todo-google-sync pending")
+    errors = []
+    for key, item in local_lists.items():
+        if key not in states:
+            try:
+                created = create_mapped_list(api, state, checkpoint, key, item["title"], remote)
+                remote[created["id"]] = created
+            except (SyncError, OSError) as error:
+                errors.append(error)
+    if state["pending_lists"]:
+        raise errors[0]
+    mapped = {item["list_id"] for item in states.values()}
+    for remote_id, item in remote.items():
+        if remote_id not in mapped:
+            key = stable_id("google-list-", remote_id)
+            if key in local_lists:
+                raise SyncError("A new Google list has a conflicting local identifier")
+            local_lists[key] = {"id": key, "title": item["title"]}
+            states[key] = {"list_id": remote_id, "instance": uuid.uuid4().hex, "entries": {}}
+    for key, item in local_lists.items():
+        if key not in states:
+            continue
+        remote_item = remote.get(states[key]["list_id"])
+        if remote_item:
+            item["title"] = remote_item["title"]
+            item.pop("available", None)
+        else:
+            item["available"] = False
+    lists = list(local_lists.values())
+    if lists != snapshot["lists"]:
+        local.apply_document(snapshot, {"lists": lists, "todos": snapshot["todos"]}, directory)
+    checkpoint(state)
+    totals = {"lists": 0, "tasks": 0, "conflicts_preserved": 0, "hierarchy_deferred": 0,
+              "unavailable_lists": 0}
+    for key, list_state in states.items():
+        if list_state["list_id"] not in remote:
+            totals["unavailable_lists"] += 1
+            continue
+        api.list_id = list_state["list_id"]
+        list_directory = directory / "lists" / stable_id("", key)
+        list_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            result = sync(api, ListTodos(local, key), list_state, lambda _: checkpoint(state), list_directory)
+            totals["lists"] += 1
+            for field in ("tasks", "conflicts_preserved", "hierarchy_deferred"):
+                totals[field] += result[field]
+        except (SyncError, OSError) as error:
+            errors.append(error)
+    if errors:
+        raise errors[0]
+    state["last_sync"] = now()
+    checkpoint(state)
+    return totals
+
+
+def pending_lists_report(api, state):
+    remote = api.list_lists()
+    return [{"local_list_id": key, "started_at": item["started_at"],
+             "candidate_remote_ids": [row["id"] for row in remote
+                                      if row["id"] not in item["before_ids"] and row["title"] == item["title"]]}
+            for key, item in state.get("pending_lists", {}).items()]
+
+
+def resolve_list(api, state, checkpoint, local_id, remote_id=None):
+    pending = state.get("pending_lists", {}).get(local_id)
+    if not pending:
+        raise SyncError("No pending creation for that local list")
+    if remote_id:
+        if remote_id in pending["before_ids"] or any(
+                item["list_id"] == remote_id for item in state["list_states"].values()):
+            raise SyncError("That Google list already existed or is mapped to another list")
+        match = next((item for item in api.list_lists() if item["id"] == remote_id), None)
+        if not match or match["title"] != pending["title"]:
+            raise SyncError("The Google list does not match the pending creation")
+        state["list_states"][local_id] = {"list_id": remote_id, "instance": uuid.uuid4().hex, "entries": {}}
+        checkpoint(state)
+    del state["pending_lists"][local_id]
+    checkpoint(state)
 
 
 def create_mapped(api, state, checkpoint, tasks, local_id, fields):
@@ -447,7 +650,7 @@ def sync(api, local, state, checkpoint, state_dir):
             if collision:
                 # Deterministic IDs avoid repeated copies if the local compare
                 # and swap loses a race and the sync is retried.
-                conflict_id = stable_id("conflict-", entry["remote_id"] + json.dumps(remote, sort_keys=True))
+                conflict_id = stable_id("conflict-", state["list_id"] + ":" + entry["remote_id"] + json.dumps(remote, sort_keys=True))
                 if conflict_id not in by_id:
                     conflict = import_row(conflict_id, task)
                     conflict["parentId"] = reverse.get(task.get("parent"))
@@ -650,7 +853,7 @@ def main():
     auth.add_argument("--no-browser", action="store_true", help="Print the URL for manual opening on this computer")
     subparsers.add_parser(
         "sync", help="Perform one two-way synchronization",
-        description="Synchronize titles, dates, notes, completion and deletions with the selected Google list. "
+        description="Synchronize all Google task lists, including titles, dates, notes, completion and deletions. "
         "Synchronize parent/subtask relationships in both directions. Concurrent text edits "
         "retain both versions without adding labels. Dates are calendar dates without times. "
         "Sibling ordering is left unchanged. Legacy sync markers are removed from Google notes.",
@@ -659,10 +862,16 @@ def main():
     subparsers.add_parser("pending", help="Show identifiers for interrupted task creations needing review")
     resolve = subparsers.add_parser("resolve-create", help="Reconcile an interrupted Google task creation")
     resolve.add_argument("--local-id", required=True)
+    resolve.add_argument("--local-list-id", default="default", help="Local list identifier (default: original Dank Todo list)")
     resolution = resolve.add_mutually_exclusive_group(required=True)
     resolution.add_argument("--remote-id", help="Bind to the matching Google task after reviewing it")
     resolution.add_argument("--not-created", action="store_true",
                             help="Confirm no task was created; allow creation on the next sync")
+    resolve_list_parser = subparsers.add_parser("resolve-list", help="Reconcile an interrupted Google list creation")
+    resolve_list_parser.add_argument("--local-list-id", required=True)
+    list_resolution = resolve_list_parser.add_mutually_exclusive_group(required=True)
+    list_resolution.add_argument("--remote-list-id")
+    list_resolution.add_argument("--not-created", action="store_true")
     args = parser.parse_args()
     directory = args.state_dir
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -674,10 +883,13 @@ def main():
             return
         state = read_json(directory / "state.json", {})
         if args.command == "status":
+            states = state.get("list_states", {"default": state})
             print(json.dumps({"connected": (directory / "token.json").exists(),
                               "last_sync": state.get("last_sync"),
-                              "mapped_tasks": len(state.get("entries", {})),
-                              "pending_creations": len(state.get("pending_creations", {}))}, indent=2))
+                              "mapped_lists": len(states),
+                              "mapped_tasks": sum(len(item.get("entries", {})) for item in states.values()),
+                              "pending_creations": sum(len(item.get("pending_creations", {})) for item in states.values()),
+                              "pending_lists": len(state.get("pending_lists", {}))}, indent=2))
             return
         if not (directory / "token.json").exists():
             raise SyncError("Connect first: dank-todo-google-sync auth")
@@ -686,30 +898,33 @@ def main():
         settings = read_json(directory / "settings.json", {})
         if not settings.get("list_id"):
             raise SyncError("Missing list settings; run auth again")
-        if state.get("version", 1) not in (1, 2, 3):
+        if state.get("version", 1) not in (1, 2, 3, 4):
             raise SyncError("Unsupported sync state version")
-        if state.get("list_id", settings["list_id"]) != settings["list_id"]:
-            raise SyncError("Google list changed; refusing to reuse another list's task mapping")
-        if state.get("version", 1) != 3:
-            atomic_json(directory / "backups" / (str(time.time_ns()) +
-                        "-state-v" + str(state.get("version", 1)) + ".json"), state)
-        # Old clients would discard date/note fields when applying local data.
-        state["version"] = 3
-        state.setdefault("instance", uuid.uuid4().hex)
-        state["list_id"] = settings["list_id"]
         checkpoint = lambda data: atomic_json(directory / "state.json", data)
-        # Persist the instance before any remote create, including empty lists.
-        checkpoint(state)
         api = GoogleTasks(credentials)
-        api.list_id = settings["list_id"]
         try:
             if args.command == "pending":
-                print(json.dumps(pending_report(api, state), indent=2))
+                migrate_lists(state, settings, directory, checkpoint)
+                report = {"lists": pending_lists_report(api, state), "tasks": []}
+                for key, item in state["list_states"].items():
+                    if item.get("pending_creations"):
+                        api.list_id = item["list_id"]
+                        report["tasks"].extend({"local_list_id": key, **row} for row in pending_report(api, item))
+                print(json.dumps(report, indent=2))
             elif args.command == "resolve-create":
-                resolve_creation(api, state, checkpoint, args.local_id, args.remote_id)
+                migrate_lists(state, settings, directory, checkpoint)
+                item = state["list_states"].get(args.local_list_id)
+                if item is None:
+                    raise SyncError("Unknown local list")
+                api.list_id = item["list_id"]
+                resolve_creation(api, item, lambda _: checkpoint(state), args.local_id, args.remote_id)
                 print("Creation reconciled. Run: dank-todo-google-sync sync")
+            elif args.command == "resolve-list":
+                migrate_lists(state, settings, directory, checkpoint)
+                resolve_list(api, state, checkpoint, args.local_list_id, args.remote_list_id)
+                print("List creation reconciled. Run: dank-todo-google-sync sync")
             else:
-                print(json.dumps(sync(api, DmsTodos(), state, checkpoint, directory)))
+                print(json.dumps(sync_lists(api, DmsTodos(), state, settings, checkpoint, directory)))
         finally:
             atomic_json(directory / "token.json", json.loads(credentials.to_json()))
 

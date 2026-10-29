@@ -19,6 +19,24 @@ The sync runs locally as your desktop user. GitHub Pages hosts informational doc
 
 Dates have no time component or reminders; sibling ordering is not actively synchronized. Existing exact sync-marker lines and generated conflict-copy suffixes are removed automatically while preserving other user text. Existing flat exports acquire their DMS parent relationships without recreating the tasks. Google does not allow hidden completed tasks to be reparented; such moves are deferred until Google permits them. Existing tasks on both sides are combined on first sync, not matched by title. Intentional deletions propagate, so keep backups of important tasks.
 
+## Multiple lists
+
+Switch lists using the horizontally scrollable tabs at the top of the DMS popup.
+The **+** button creates a separate list in DMS and Google Tasks. All connected
+lists sync in the background, including inactive tabs. Active / All / Done and
+Clear done apply only to the selected list. Save or cancel an open task editor
+before switching tabs.
+
+Rename lists in Google Tasks; their tab names update automatically. Duplicate
+names remain separate lists. Deleting a Google list keeps its local tasks with
+an unavailable message. Moving tasks between lists and deleting lists from DMS
+are not implemented.
+
+The first sync migrates storage and sync state to version 4, privately backing up
+the previous mapping and local document. Existing tasks keep their original list
+and Google identifiers. Deploy the plugin and sync client together; older clients
+refuse the migrated state.
+
 ## Dates and notes
 
 Click a task’s pencil to edit its title, date, and multiline notes. Choose a date
@@ -34,7 +52,7 @@ upstream base and MIT license recorded there. See `plugin/UPSTREAM.md`.
 
 ## NixOS installation
 
-Requires NixOS/nixpkgs with `programs.dms-shell.plugins` support, a running DMS desktop session, and Home Manager integrated as a NixOS module. The module installs the maintained Dank Todo v1.3.0 fork under `plugin/` declaratively; no `dms plugins install` step is needed.
+Requires NixOS/nixpkgs with `programs.dms-shell.plugins` support, a running DMS desktop session, and Home Manager integrated as a NixOS module. The module installs the maintained Dank Todo v1.4.0 fork under `plugin/` declaratively; no `dms plugins install` step is needed.
 
 Add this flake input:
 
@@ -81,7 +99,7 @@ dank-todo-google-sync sync
 systemctl --user restart dank-todo-google-sync.timer
 ```
 
-Sign in with the intended Google account. The authorization uses Google's browser flow, PKCE, and a temporary loopback callback. It requests offline Tasks access. The default list is **Dank Todo**, created if needed. Use `auth --list-id LIST_ID` when selecting an existing list for the first authorization. Reauthorization preserves the existing list mapping and verifies API access before replacing credentials.
+Sign in with the intended Google account. The authorization uses Google's browser flow, PKCE, and a temporary loopback callback. It requests offline Tasks access. The original list is **Dank Todo**, created if needed. All Google Tasks lists are then discovered and synchronized; each appears as a separate DMS tab. Use `auth --list-id LIST_ID` when selecting an existing list for the first authorization. Reauthorization preserves the existing list mapping and verifies API access before replacing credentials.
 
 After switching from Testing to In production, run `auth` again to obtain a new authorization. This removes the Testing-specific seven-day limit; tokens can still be revoked or expire for other reasons.
 
@@ -109,9 +127,9 @@ dank-todo-google-sync resolve-create --local-id LOCAL_ID --not-created
 dank-todo-google-sync sync
 ```
 
-The pending command reports identifiers and candidate identifiers, without printing task text. It never guesses based on titles alone. Only bind a task after checking it in Google Tasks.
+The pending command reports identifiers and candidate identifiers for tasks and lists, without printing task text. For another list, include `--local-list-id LOCAL_LIST_ID` with `resolve-create`. For interrupted list creation use `resolve-list --local-list-id LOCAL_LIST_ID --remote-list-id GOOGLE_LIST_ID`, or `--not-created` only after confirming no list was created. It never guesses based on titles alone. Only bind a task after checking it in Google Tasks.
 
-The first run migrates synchronization state to version 3 and saves a private backup of the previous version. Older clients refuse this state format. Rollbacks require care to avoid restoring stale task mappings; keep the upgraded client installed with its state.
+The first run migrates synchronization state to version 4 and saves private backups of the previous version and local document. Older clients refuse this state format. Rollbacks require care to avoid restoring stale task mappings; keep the upgraded client installed with its state.
 
 To disconnect:
 

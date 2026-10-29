@@ -1,8 +1,8 @@
 {
   "id": "dankTodo",
   "name": "Dank Todo",
-  "description": "Personal tasks with dates, notes and Google Tasks synchronization",
-  "version": "1.3.0",
+  "description": "Multiple task lists with dates, notes and Google Tasks synchronization",
+  "version": "1.4.0",
   "license": "MIT",
   "author": "Deepu K Sasidharan",
   "icon": "checklist",

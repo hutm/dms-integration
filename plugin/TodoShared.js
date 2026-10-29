@@ -7,27 +7,32 @@ var models = Object.create(null)
 function attach(widget, rows) {
     const path = widget.storageFilePath
     if (!models[path])
-        models[path] = {todos: rows, widgets: []}
+        models[path] = {todos: rows, lists: widget.lists, widgets: []}
     const model = models[path]
     if (model.widgets.indexOf(widget) === -1)
         model.widgets.push(widget)
     return model
 }
 
-function load(widget, diskRows) {
+function load(widget, diskRows, diskLists) {
+    if (!models[widget.storageFilePath] && diskLists)
+        widget.lists = diskLists
     const model = attach(widget, diskRows)
     // Another instance may have saved while this asynchronous read was pending.
     // Its in-memory model is newer than the file read and remains authoritative.
     widget.todos = model.todos
+    widget.lists = model.lists
     widget.revision++
 }
 
 function publish(widget) {
     const model = attach(widget, widget.todos)
     model.todos = widget.todos
+    model.lists = widget.lists
     for (const peer of model.widgets) {
         if (peer !== widget) {
             peer.todos = model.todos
+            peer.lists = model.lists
             peer.revision++
         }
     }

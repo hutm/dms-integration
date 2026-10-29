@@ -6,7 +6,7 @@ const plugin = process.argv[2] || path.join(__dirname, 'plugin');
 const js = fs.readFileSync(path.join(plugin, 'TodoShared.js'), 'utf8').replace(/^\.pragma library\s*/m, '');
 const shared = vm.createContext({});
 vm.runInContext(js, shared);
-function widget(path) { return {storageFilePath: path, todos: [], revision: 0}; }
+function widget(path) { return {storageFilePath: path, todos: [], lists: [{id:'default', title:'Dank Todo'}], revision: 0}; }
 const a = widget('/tasks'), b = widget('/tasks'), c = widget('/other');
 shared.load(a, [{id:'parent'}]);
 shared.load(b, []);
@@ -48,3 +48,36 @@ assert.equal(fields.mergeDetails(current, {...draft, notes:'Local edit'}, base),
 console.log('Open-editor concurrent edit checks passed');
 
 assert.equal(fields.notesLength('🗒'.repeat(8192)), 8192, 'Unicode note limits count characters rather than UTF-16 code units');
+
+const e = widget('/lists'), f = widget('/lists');
+shared.load(e, [{id:'a', listId:'default'}], [{id:'default', title:'Original'}, {id:'work', title:'Work'}]);
+shared.load(f, [], [{id:'default', title:'Stale'}]);
+assert.equal(f.lists, e.lists, 'late monitor initialization must use current list metadata');
+e.lists = e.lists.map(list => list.id === 'work' ? {...list, title:'Renamed remotely'} : list);
+shared.publish(e);
+assert.equal(f.lists[1].title, 'Renamed remotely', 'tab names must update across all monitors');
+assert.equal(f.todos, e.todos);
+
+const lists = vm.createContext({});
+vm.runInContext(fs.readFileSync(path.join(plugin, 'TodoLists.js'), 'utf8').replace(/^\.pragma library\s*/m, ''), lists);
+const document = {lists:[{id:'a', title:'Personal'}, {id:'b', title:'Work'}], todos:[
+  {id:'parent', listId:'a'}, {id:'child', listId:'a', parentId:'parent'}, {id:'other', listId:'b'}
+]};
+assert.equal(lists.validDocument(document), true);
+assert.equal(lists.validDocument({...document, lists:[...document.lists, {id:'a', title:'Duplicate'}]}), false);
+assert.equal(lists.validDocument({...document, todos:[...document.todos, {id:'cross', listId:'b', parentId:'parent'}]}), false, 'cross-list parents must be rejected');
+assert.equal(lists.validDocument({...document, todos:[{id:'x', listId:'unknown'}]}), false);
+assert.equal(lists.validDocument({...document, todos:[{id:'x', listId:'a', parentId:'y'}, {id:'y', listId:'a', parentId:'x'}]}), false);
+
+// Execute the actual QML model methods to check the tab-scoped destructive action.
+const qml = fs.readFileSync(path.join(plugin, 'DankTodoWidget.qml'), 'utf8');
+const model = vm.createContext({todos:[
+  {id:'a', listId:'personal', completed:true}, {id:'b', listId:'work', completed:true},
+  {id:'c', listId:'personal', completed:false}
+], activeListId:'personal', revision:0, saveTodos() {}});
+const clearDone = qml.match(/    function clearCompleted\(\) \{[\s\S]*?\n    \}/)[0];
+vm.runInContext(clearDone + '\nclearCompleted()', model);
+assert.ok(model.todos[0].deletedAt);
+assert.equal(model.todos[1].deletedAt, undefined, 'Clear done must not delete completed tasks in another tab');
+assert.equal(model.todos[2].deletedAt, undefined);
+console.log('Multiple-list isolation, shared tabs and payload validation checks passed');

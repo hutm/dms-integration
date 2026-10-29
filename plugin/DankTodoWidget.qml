@@ -9,6 +9,7 @@ import qs.Modules.Plugins
 import "."
 import "TodoShared.js" as SharedTodos
 import "TodoFields.js" as Fields
+import "TodoLists.js" as Lists
 
 PluginComponent {
     id: root
@@ -37,13 +38,16 @@ PluginComponent {
 
     property bool syncWriteFailed: false
     property var todos: []
+    property var lists: [{id: "default", title: "Dank Todo"}]
+    property string activeListId: "default"
+    readonly property var activeList: lists.find(list => list.id === activeListId) || lists[0]
     property int revision: 0
     property string filter: "active"
     readonly property int visibleCount: {
         revision
         let n = 0
         for (let i = 0; i < todos.length; i++) {
-            if (!todos[i].deletedAt)
+            if (!todos[i].deletedAt && todos[i].listId === activeListId)
                 n++
         }
         return n
@@ -53,7 +57,7 @@ PluginComponent {
         revision
         let n = 0
         for (let i = 0; i < todos.length; i++) {
-            if (!todos[i].deletedAt && !todos[i].completed)
+            if (!todos[i].deletedAt && todos[i].listId === activeListId && !todos[i].completed)
                 n++
         }
         return n
@@ -67,6 +71,27 @@ PluginComponent {
         return Date.now().toString(36) + Math.random().toString(36).substring(2, 8)
     }
 
+    function documentToken() {
+        return Qt.md5(storageFilePath + "\n" + JSON.stringify({lists: lists, todos: todos}))
+    }
+
+    function createList(title) {
+        const name = String(title || "").trim()
+        if (!name || name.length > 1024) return ""
+        const id = "list-" + uid()
+        lists = lists.concat([{id: id, title: name}])
+        activeListId = id
+        revision++
+        saveTodos()
+        return id
+    }
+
+    function selectList(id) {
+        if (!lists.some(list => list.id === id)) return false
+        activeListId = id
+        return true
+    }
+
     function ensureStorageReady() {
         Quickshell.execDetached(["mkdir", "-p", resolvedStorageDir])
     }
@@ -75,7 +100,8 @@ PluginComponent {
         // Every monitor and the sync IPC must see the same model before saving.
         SharedTodos.publish(root)
         const data = {
-            version: 3,
+            version: 4,
+            lists: lists,
             todos: todos
         }
         todoFile.setText(JSON.stringify(data, null, 2))
@@ -88,7 +114,7 @@ PluginComponent {
 
     function filteredTodos(filterKey) {
         revision
-        const visibleTodos = todos.filter(t => !t.deletedAt)
+        const visibleTodos = todos.filter(t => !t.deletedAt && t.listId === activeListId)
         if (filterKey === "active")
             return visibleTodos.filter(t => !t.completed && !hasCompletedAncestor(t.id))
         if (filterKey === "done")
@@ -162,13 +188,17 @@ PluginComponent {
         const trimmed = String(text || "").replace(/\s+/g, " ").trim()
         if (!trimmed.length)
             return false
-        if (visibleCount >= maxItems) {
+        const parent = parentId ? todos.find(t => t.id === parentId && !t.deletedAt) : null
+        if (parentId && !parent) return false
+        const listId = parent ? parent.listId : activeListId
+        if (todos.filter(t => !t.deletedAt && t.listId === listId).length >= maxItems) {
             if (typeof ToastService !== "undefined")
                 ToastService.showWarning("Max " + maxItems + " todos reached")
             return false
         }
         const entry = {
             id: uid(),
+            listId: listId,
             text: trimmed.substring(0, maxTextLength),
             completed: false,
             dueDate: "",
@@ -178,7 +208,7 @@ PluginComponent {
         }
         if (entry.parentId) {
             // Insert right after parent so it becomes the first visible child
-            const parentIdx = todos.findIndex(t => t.id === entry.parentId && !t.deletedAt)
+            const parentIdx = todos.findIndex(t => t.id === entry.parentId && t.listId === listId && !t.deletedAt)
             if (parentIdx === -1) {
                 entry.parentId = null
                 todos = [entry].concat(todos)
@@ -238,6 +268,8 @@ PluginComponent {
         const sourceIdx = todos.findIndex(t => t.id === sourceId && !t.deletedAt)
         const targetIdx = todos.findIndex(t => t.id === targetId && !t.deletedAt)
         if (sourceIdx === -1 || targetIdx === -1)
+            return
+        if (todos[sourceIdx].listId !== todos[targetIdx].listId)
             return
 
         const sourceIndices = subtreeIndices(sourceId)
@@ -336,7 +368,7 @@ PluginComponent {
         const deletedAt = new Date().toISOString()
         let changed = false
         const next = todos.map(t => {
-            if (t.deletedAt || !t.completed)
+            if (t.deletedAt || !t.completed || t.listId !== activeListId)
                 return t
             changed = true
             return Object.assign({}, t, {
@@ -391,6 +423,7 @@ PluginComponent {
                 seenIds.add(id)
                 clean.push({
                     id: id,
+                    listId: typeof t.listId === "string" ? t.listId : "default",
                     text: String(t.text),
                     completed: Boolean(t.completed),
                     dueDate: String(t.dueDate || ""),
@@ -408,10 +441,18 @@ PluginComponent {
             for (let i = 0; i < clean.length; i++) {
                 const pid = clean[i].parentId
                 const parent = pid ? byId.get(pid) : null
-                if (pid && (!parent || parent.deletedAt))
+                if (pid && (!parent || parent.deletedAt || parent.listId !== clean[i].listId))
                     clean[i].parentId = null
             }
-            SharedTodos.load(root, clean)
+            const lists = parsed && Array.isArray(parsed.lists) && parsed.lists.length
+                ? parsed.lists : [{id: "default", title: "Dank Todo"}]
+            for (const row of clean) {
+                if (!lists.some(list => list.id === row.listId))
+                    lists.push({id: row.listId, title: "Recovered list"})
+            }
+            SharedTodos.load(root, clean, lists)
+            if (!root.lists.some(list => list.id === root.activeListId))
+                root.activeListId = root.lists[0].id
         }
         onSaveFailed: error => { root.syncWriteFailed = true }
         onLoadFailed: error => {
@@ -436,23 +477,25 @@ PluginComponent {
             if (!todoFile.loaded)
                 return JSON.stringify({error: "NOT_READY"})
             return JSON.stringify({
-                schemaVersion: 3,
-                token: Qt.md5(root.storageFilePath + "\n" + JSON.stringify(root.todos)),
+                schemaVersion: 4,
+                token: root.documentToken(),
                 storageFilePath: root.storageFilePath,
+                lists: root.lists,
                 todos: root.todos
             })
         }
 
         function syncApply(expected: string, payloadPath: string): string {
-            if (Qt.md5(root.storageFilePath + "\n" + JSON.stringify(root.todos)) !== expected)
+            if (root.documentToken() !== expected)
                 return "CONFLICT"
             try {
                 syncPayload.path = payloadPath
                 if (!syncPayload.waitForJob())
                     return "READ_FAILED"
-                const next = JSON.parse(syncPayload.text())
-                if (!Array.isArray(next))
+                const document = JSON.parse(syncPayload.text())
+                if (!Lists.validDocument(document))
                     return "INVALID_PAYLOAD"
+                const next = document.todos
                 const ids = new Set()
                 for (const entry of next) {
                     if (!entry || typeof entry.id !== "string" || typeof entry.text !== "string"
@@ -466,16 +509,25 @@ PluginComponent {
                     if (!ids.has(entry.id))
                         return "MISSING_RECORD"
                 }
+                if (root.lists.some(list => !document.lists.some(next => next.id === list.id)))
+                    return "MISSING_LIST"
+                for (const entry of root.todos) {
+                    if (next.find(row => row.id === entry.id).listId !== entry.listId)
+                        return "LIST_CHANGED"
+                }
                 // Loading a staged file can finish after another local change.
-                if (Qt.md5(root.storageFilePath + "\n" + JSON.stringify(root.todos)) !== expected)
+                if (root.documentToken() !== expected)
                     return "CONFLICT"
                 const previous = root.todos
+                const previousLists = root.lists
                 root.syncWriteFailed = false
                 todoFile.blockWrites = true
                 root.todos = next
+                root.lists = document.lists
                 root.saveTodos()
                 if (root.syncWriteFailed) {
                     root.todos = previous
+                    root.lists = previousLists
                     SharedTodos.publish(root)
                     root.revision++
                     return "WRITE_FAILED"
@@ -494,6 +546,10 @@ PluginComponent {
             const ok = root.addTodo(text, null)
             return ok ? "OK" : "FAILED"
         }
+
+        function createList(title: string): string { return root.createList(title) || "INVALID_TITLE" }
+        function selectList(id: string): string { return root.selectList(id) ? "OK" : "UNKNOWN_LIST" }
+        function lists(): string { return JSON.stringify(root.lists) }
 
         function addChild(text: string, parentId: string): string {
             const ok = root.addTodo(text, parentId)
@@ -613,6 +669,96 @@ PluginComponent {
                 property string editingId: ""
                 property var editingBase: ({})
                 property bool editConflict: false
+                property bool creatingList: false
+
+                Row {
+                    width: parent.width
+                    spacing: Theme.spacingXS
+
+                    Flickable {
+                        width: parent.width - 36 - Theme.spacingXS
+                        height: 36
+                        contentWidth: listTabs.width
+                        clip: true
+                        boundsBehavior: Flickable.StopAtBounds
+                        flickableDirection: Flickable.HorizontalFlick
+
+                        Row {
+                            id: listTabs
+                            spacing: Theme.spacingXS
+                            Repeater {
+                                model: root.lists
+                                Rectangle {
+                                    width: Math.min(190, tabLabel.implicitWidth + 24)
+                                    height: 34
+                                    radius: Theme.cornerRadius
+                                    color: root.activeListId === modelData.id ? Theme.primary : Theme.surfaceContainerHigh
+                                    StyledText {
+                                        id: tabLabel
+                                        anchors.centerIn: parent
+                                        width: Math.min(166, implicitWidth)
+                                        text: modelData.title
+                                        elide: Text.ElideRight
+                                        color: root.activeListId === modelData.id ? Theme.onPrimary : Theme.surfaceText
+                                        font.pixelSize: Theme.fontSizeSmall
+                                    }
+                                    MouseArea {
+                                        objectName: "todoListTab-" + modelData.id
+                                        anchors.fill: parent
+                                        cursorShape: Qt.PointingHandCursor
+                                        enabled: !popoutColumn.editingId && !popoutColumn.addingChildOfId
+                                        onClicked: root.selectList(modelData.id)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    TodoButton {
+                        width: 36
+                        height: 34
+                        text: "+"
+                        enabled: !popoutColumn.editingId && !popoutColumn.addingChildOfId
+                        onClicked: {
+                            popoutColumn.creatingList = !popoutColumn.creatingList
+                            if (popoutColumn.creatingList) listNameInput.forceActiveFocus()
+                        }
+                    }
+                }
+
+                Row {
+                    width: parent.width
+                    spacing: Theme.spacingS
+                    visible: popoutColumn.creatingList
+                    DankTextField {
+                        id: listNameInput
+                        objectName: "todoListNameInput"
+                        width: parent.width - 84 - Theme.spacingS
+                        placeholderText: "New list name"
+                        maximumLength: 1024
+                        function submit() {
+                            if (root.createList(text)) {
+                                text = ""
+                                popoutColumn.creatingList = false
+                            }
+                        }
+                        onAccepted: submit()
+                        Keys.onEscapePressed: { popoutColumn.creatingList = false; text = "" }
+                    }
+                    TodoButton {
+                        width: 84
+                        text: "Create"
+                        onClicked: listNameInput.submit()
+                    }
+                }
+
+                StyledText {
+                    width: parent.width
+                    visible: root.activeList && root.activeList.available === false
+                    text: "This list is unavailable in Google Tasks. Your tasks are kept here."
+                    wrapMode: Text.WordWrap
+                    color: Theme.surfaceVariantText
+                    font.pixelSize: Theme.fontSizeSmall
+                }
 
                 readonly property string addingChildOfText: {
                     if (!addingChildOfId)

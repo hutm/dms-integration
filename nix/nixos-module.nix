@@ -31,7 +31,7 @@ in {
         Service = {
           Type = "oneshot";
           ExecStart = "${sync}/bin/dank-todo-google-sync sync";
-          TimeoutStartSec = 180;
+          TimeoutStartSec = 600;
           UMask = "0077";
           NoNewPrivileges = true;
           PrivateTmp = true;
